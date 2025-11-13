@@ -111,21 +111,45 @@ def rotate_to_center(robot, tag, camera, tolerance=10):
 def rangefinder_distance(range_finder):
     """
     Returns a robust front distance in meters.
-    Handles NaN / inf by treating them as 'no obstacle' (large distance).
+    Fixes:
+      - Uses width & height to sample the true center (3x3 window).
+      - Uses median of that window to reduce noise.
+      - Uses getMaxRange() to clamp invalid readings.
     """
+    width = range_finder.getWidth()
+    height = range_finder.getHeight()
+    max_range = range_finder.getMaxRange()
+
     image = range_finder.getRangeImage()
     if image is None or len(image) == 0:
-        return 100.0
+        return max_range
 
-    idx = len(image) // 2
-    try:
-        val = float(image[idx])
-    except Exception:
-        return 100.0
+    # Webots returns width*height floats in row-major order.
+    cx = width // 2
+    cy = height // 2
 
-    # If sensor returns NaN / inf or extremely small distance, treat as 'no reading'
-    if not np.isfinite(val) or val <= 0.03:
-        return 100.0
+    vals = []
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            x = min(max(cx + dx, 0), width - 1)
+            y = min(max(cy + dy, 0), height - 1)
+            idx = y * width + x
+            try:
+                v = float(image[idx])
+            except Exception:
+                continue
+            if np.isfinite(v) and v > 0.0:
+                vals.append(v)
+
+    if not vals:
+        return max_range
+
+    val = float(np.median(vals))
+
+    if not np.isfinite(val) or val <= 0.0:
+        return max_range
+    if val > max_range:
+        val = max_range
 
     return val
 
@@ -356,10 +380,10 @@ def run_robot():
                 if not centered:
                     continue
 
-                # Get tag distance from range finder
+                # Get tag distance from range finder (front distance)
                 measured_dist = rangefinder_distance(range_finder)
                 if not np.isfinite(measured_dist):
-                    measured_dist = 100.0
+                    measured_dist = range_finder.getMaxRange()
 
                 tag_coord_x = rover_x + measured_dist * math.sin(rover_yaw)
                 tag_coord_y = rover_y + measured_dist * math.cos(rover_yaw)
