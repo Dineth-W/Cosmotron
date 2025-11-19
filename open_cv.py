@@ -12,7 +12,7 @@ MAX_SPEED = 2000.0         # logical max for turns, also clamped
 TAG_FAMILY = "tag25h9"
 TAG_SIZE = 0.20            # meters
 TARGET_TAG_IDS = [0, 1, 2]
-WAYPOINT_TOLERANCE = 0.08  # meters
+WAYPOINT_TOLERANCE = 0.02  # meters
 
 # MOTOR NAMES
 JOINT_NAMES = [
@@ -76,14 +76,16 @@ def select_nearest_tag(detections, camera_params, tag_size=TAG_SIZE):
         tag_dist = float('inf')
 
         # 1) If pose is available, use the Z distance from the camera
-        if hasattr(d, 'pose_t') and d.pose_t is not None and len(d.pose_t) == 3:
+        if hasattr(d, 'pose_t') and d.pose_t is not None:
             try:
-                tag_dist = abs(float(d.pose_t[2]))
+                t = np.array(d.pose_t).reshape(-1)  # handle (3,1) or (3,)
+                if len(t) >= 3:
+                    tag_dist = abs(float(t[2]))
             except Exception:
                 tag_dist = float('inf')
 
         # 2) Otherwise, estimate from pixel width of the tag
-        elif len(d.corners) == 4:
+        if (not np.isfinite(tag_dist) or tag_dist == float('inf')) and hasattr(d, 'corners') and len(d.corners) == 4:
             c = np.array(d.corners)
             tag_width_px = np.linalg.norm(c[0] - c[1])
             if tag_width_px > 0:
@@ -159,56 +161,72 @@ def turn_to_heading(robot, current_yaw, target_yaw, turn_gain=1800, tol=0.1, max
     robot.step(TIME_STEP)
 
 
-def go_to_waypoint(robot, start, goal, heading):
+def approach_tag(robot, camera, at_detector, camera_params, target_id, desired_stop_dist):
     """
-    Simple dead-reckoning waypoint navigation.
-    (No range finder / obstacle avoidance, uses only pose estimate.)
+    Move towards the tag using CAMERA distance in a feedback loop.
+    - Re-detects the tag each cycle.
+    - Keeps it centered.
+    - Stops when measured distance ~= desired_stop_dist (within WAYPOINT_TOLERANCE).
     """
-    rover_x, rover_y = start
-    goal_x, goal_y = goal
-    dx = goal_x - rover_x
-    dy = goal_y - rover_y
-    target_dist = np.hypot(dx, dy)
-    target_heading = math.atan2(dx, dy)
+    lost_counter = 0
 
-    cur_heading = heading
-    # Align initial heading
-    turn_to_heading(robot, cur_heading, target_heading)
-    cur_heading = target_heading
+    while robot.step(TIME_STEP) != -1:
+        image_data = camera.getImage()
+        gray = webots_to_opencv(image_data, camera.getWidth(), camera.getHeight())
+        if gray is None:
+            move_wheels(0, 0)
+            print("No camera image while approaching.")
+            break
 
-    cycles = 0
-    while target_dist > WAYPOINT_TOLERANCE and cycles < 1500:
-        dx = goal_x - rover_x
-        dy = goal_y - rover_y
-        target_dist = np.hypot(dx, dy)
-        target_heading = math.atan2(dx, dy)
+        detections = at_detector.detect(
+            gray,
+            estimate_tag_pose=True,
+            camera_params=camera_params,
+            tag_size=TAG_SIZE
+        )
 
-        heading_err = ((target_heading - cur_heading + np.pi) % (2 * np.pi)) - np.pi
+        detections = [d for d in detections if d.tag_id == target_id]
 
-        if abs(heading_err) > 0.06:
-            # Align heading in-place, then move
+        if not detections:
+            lost_counter += 1
+            print(f"[Approach] Tag {target_id} lost ({lost_counter}).")
+            if lost_counter > 10:
+                print("[Approach] Tag lost for too long, stopping.")
+                move_wheels(0, 0)
+                break
+
+            # Slow rotate to search again
+            move_wheels(0.2 * MAX_WHEEL_VELOCITY, -0.2 * MAX_WHEEL_VELOCITY)
+            continue
+
+        lost_counter = 0
+
+        selected_tag, _, dist = select_nearest_tag(detections, camera_params, TAG_SIZE)
+        if selected_tag is None or not np.isfinite(dist):
+            print("[Approach] Invalid distance from tag, skipping step.")
+            continue
+
+        # Keep it centered
+        centered = rotate_to_center(robot, selected_tag, camera)
+        if not centered:
+            # rotate_to_center already stepped the robot
+            continue
+
+        print(f"[Approach] Tag {target_id}: dist={dist:.3f} m, target={desired_stop_dist:.3f} m")
+
+        # Check if we reached the desired distance
+        if dist <= desired_stop_dist + WAYPOINT_TOLERANCE:
+            print("[Approach] Reached desired stop distance from tag.")
             move_wheels(0, 0)
             robot.step(TIME_STEP)
-            turn_to_heading(robot, cur_heading, target_heading)
-            cur_heading = target_heading
+            break
 
-        print(f"Waypoint nav: dist={target_dist:.2f}, heading_err={heading_err:.2f}")
-
-        # Move forward towards goal
+        # Move a bit forward
         move_wheels(VELOCITY, VELOCITY)
-        for _ in range(3):
+        for _ in range(2):
             robot.step(TIME_STEP)
 
-        # Dead-reckoning (approx position update)
-        rover_x += np.sin(cur_heading) * 0.03  # ~3 cm per cycle
-        rover_y += np.cos(cur_heading) * 0.03
-        cycles += 1
-
     move_wheels(0, 0)
-    robot.step(TIME_STEP)
-    print("Reached waypoint.")
-
-    return rover_x, rover_y, cur_heading
 
 
 def run_robot():
@@ -257,12 +275,18 @@ def run_robot():
     print(f"[INFO] Detected MAX_WHEEL_VELOCITY = {MAX_WHEEL_VELOCITY}")
 
     # Camera intrinsics: (fx, fy, cx, cy)
-    camera_params = (
-        600.0,                           # fx (approx)
-        600.0,                           # fy (approx)
-        camera.getWidth() / 2.0,         # cx
-        camera.getHeight() / 2.0         # cy
-    )
+    # Better: compute fx, fy from Webots FOV instead of hard-coded 600
+    width = camera.getWidth()
+    height = camera.getHeight()
+    fov = camera.getFov()  # horizontal FOV in radians
+
+    fx = (width / 2.0) / math.tan(fov / 2.0)
+    fy = fx  # assuming square pixels
+    cx = width / 2.0
+    cy = height / 2.0
+
+    camera_params = (fx, fy, cx, cy)
+    print(f"[INFO] Camera params: fx={fx:.2f}, fy={fy:.2f}, cx={cx:.2f}, cy={cy:.2f}")
 
     at_detector = Detector(
         families=TAG_FAMILY,
@@ -271,8 +295,8 @@ def run_robot():
         refine_edges=1
     )
 
-    # --- COORDINATE MAPPING STATE ---
-    rover_x, rover_y, rover_yaw = 0.0, 0.0, 0.0  # (x, y, heading(rad))
+    # --- STATE (optional, just for logging) ---
+    rover_x, rover_y, rover_yaw = 0.0, 0.0, 0.0
     visited_tags = set()
 
     print("Starting multi-tag mission...")
@@ -282,8 +306,7 @@ def run_robot():
         print(f"\n=== Mission step {mission_step + 1} ===")
         found_tag = False
         tag_id = None
-        goal_x = None
-        goal_y = None
+        measured_dist = None
 
         # --- SEARCH FOR NEXT UNVISITED TAG ---
         search_loops = 0
@@ -331,37 +354,13 @@ def run_robot():
                 if not centered:
                     continue
 
-                # 2) Use the CAMERA-BASED distance (selected_dist)
                 measured_dist = float(selected_dist)
-
-                tag_coord_x = rover_x + measured_dist * math.sin(rover_yaw)
-                tag_coord_y = rover_y + measured_dist * math.cos(rover_yaw)
                 tag_id = selected_id
 
                 print(
                     f"\n--- Tag acquired (camera-based distance) ---\n"
-                    f"Rover at (x={rover_x:.2f}, y={rover_y:.2f}), heading={rover_yaw:.2f} rad.\n"
-                    f"Tag_id: {tag_id}, tag_coord=({tag_coord_x:.2f},{tag_coord_y:.2f}), "
-                    f"measured_dist={measured_dist:.2f} m\n"
-                )
-
-                # Calculate waypoint distance based on tag behavior
-                if tag_id == 0:
-                    # Stop 1.5 m before tag
-                    goal_dist = measured_dist - 1.5
-                else:
-                    # Stop 1.0 m before tag
-                    goal_dist = measured_dist - 1.0
-
-                if not np.isfinite(goal_dist):
-                    goal_dist = 1.0
-
-                goal_x = rover_x + goal_dist * math.sin(rover_yaw)
-                goal_y = rover_y + goal_dist * math.cos(rover_yaw)
-
-                print(
-                    f"Navigation goal: {goal_dist:.2f} m in front of tag: "
-                    f"({goal_x:.2f}, {goal_y:.2f})\n"
+                    f"Rover approx pose (x={rover_x:.2f}, y={rover_y:.2f}), heading={rover_yaw:.2f} rad.\n"
+                    f"Tag_id: {tag_id}, measured_dist={measured_dist:.2f} m\n"
                 )
 
                 found_tag = True
@@ -370,26 +369,27 @@ def run_robot():
                 move_wheels(VELOCITY * 0.3, -VELOCITY * 0.3)
                 print("No new tag found. Rotating to search...")
 
-        if not found_tag or goal_x is None or goal_y is None:
+        if not found_tag or measured_dist is None:
             print("No further tags found. Ending mission.")
             move_wheels(0, 0)
             break
 
-        # --- NAVIGATE TO TARGET COORD (no range finder) ---
-        rover_x, rover_y, rover_yaw = go_to_waypoint(
-            robot,
-            (rover_x, rover_y),
-            (goal_x, goal_y),
-            rover_yaw
-        )
+        # --- APPROACH TAG USING CAMERA DISTANCE FEEDBACK ---
+        if tag_id == 0:
+            desired_stop_dist = 1.5
+        else:
+            desired_stop_dist = 1.0
 
-        # --- Alignment at Goal: Turn 180 from approach heading ---
-        print("At goal, aligning 180° from approach direction...")
+        print(f"Approaching tag {tag_id} to stop at ~{desired_stop_dist} m.")
+        approach_tag(robot, camera, at_detector, camera_params, tag_id, desired_stop_dist)
+
+        # --- Optional: heading changes based on tag ---
+        # For now, we just do your old behaviors (turn 180, etc.)
+        print("At goal relative to tag, aligning 180° from approach direction...")
         new_yaw = (rover_yaw + np.pi) % (2 * np.pi)
         turn_to_heading(robot, rover_yaw, new_yaw)
         rover_yaw = new_yaw
 
-        # --- Perform tag-based action ---
         if tag_id == 0:
             print("ID 0: STOPPING at 1.5 m before tag, facing opposite direction. Mission ends here.")
             move_wheels(0, 0)
