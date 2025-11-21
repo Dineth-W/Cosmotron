@@ -4,6 +4,7 @@ from pupil_apriltags import Detector
 from controller import Robot, Camera, Motor
 import math
 import sys
+import time
 
 # GLOBAL CONSTANTS
 TIME_STEP = 640
