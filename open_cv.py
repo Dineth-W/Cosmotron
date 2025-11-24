@@ -176,8 +176,6 @@ def turn_relative(robot, delta_angle, tol=0.5):
     """
     Turn the rover by delta_angle (radians) relative to current yaw.
     Positive -> one turn direction, Negative -> opposite.
-    (In your current setup: check in sim which side is right/left and
-     choose signs for ID 1 and ID 2 accordingly.)
     """
     current_yaw = get_yaw()
     target_yaw = (current_yaw + delta_angle) % (2 * math.pi)
@@ -192,19 +190,22 @@ def approach_tag(robot, camera, at_detector, camera_params, target_id, desired_s
     - While the tag is visible: keep recentering and using its distance.
     - Once we've seen the tag at least once, if it later becomes partially
       blocked or disappears (close to it), we:
-        * do NOT spin to search again,
-        * instead, use the last known distance to drive forward in open loop
-          to roughly reach the desired_stop_dist.
+        * do NOT spin to search again immediately,
+        * if it stays lost for several frames in a row, then we use the last
+          known distance to drive forward in open loop to roughly reach
+          desired_stop_dist.
 
-    This way the rover can complete the approach even if the tag is only
-    partially visible or moves out of the frame near the end.
+    While we are in that "calculated steps" open-loop, we DO NOT re-center or
+    track other tags – we just finish the steps and exit.
     """
     lost_counter = 0
     seen_once = False
     last_dist = None
 
     # Approximate distance the rover moves in one "open-loop" step (meters)
-    approx_step_dist = 0.05
+    approx_step_dist = 0.6
+    # How many consecutive lost frames we tolerate before switching to open-loop
+    LOST_GRACE_FRAMES = 0
 
     while robot.step(TIME_STEP) != -1:
         image_data = camera.getImage()
@@ -225,7 +226,7 @@ def approach_tag(robot, camera, at_detector, camera_params, target_id, desired_s
 
         # --- CASE 1: Tag visible in this frame ---
         if detections:
-            lost_counter = 0
+            lost_counter = 0          # reset lost counter (tag came back)
             seen_once = True
 
             selected_tag, _, dist = select_nearest_tag(detections, camera_params, TAG_SIZE)
@@ -271,21 +272,22 @@ def approach_tag(robot, camera, at_detector, camera_params, target_id, desired_s
 
             # We HAVE seen the tag before: now it's partially blocked or out of FOV.
             lost_counter += 1
-            print(f"[Approach] Tag {target_id} temporarily lost after being seen.")
+            print(f"[Approach] Tag {target_id} temporarily lost after being seen. lost_count={lost_counter}")
 
-            # If it's only a short glitch, gently keep going forward (no spinning)
-            # if lost_counter <= 5:
-            #     move_wheels(VELOCITY * 0.5, VELOCITY * 0.5)
-            #     robot.step(TIME_STEP)
-            #     continue
+            # If it's a short glitch, just creep forward a bit and hope it reappears.
+            if lost_counter <= LOST_GRACE_FRAMES:
+                move_wheels(VELOCITY * 0.5, VELOCITY * 0.5)
+                robot.step(TIME_STEP)
+                continue
 
-            # Lost for a longer time but we had a last valid distance -> finish open-loop
+            # Lost for longer than grace window and we have a last valid distance:
+            # -> finish open-loop (calculated steps) and DO NOT track other tags
             if last_dist is not None:
                 remaining = max(0.0, last_dist - desired_stop_dist)
                 if remaining > 0.0:
                     steps = int(remaining / approx_step_dist)
-                    print(f"[Approach] Finishing in open-loop for ~{remaining:.2f} m "
-                          f"({steps} steps) using last_dist={last_dist:.2f} m.")
+                    print(f"[Approach] Tag {target_id} lost for long; finishing in open-loop "
+                          f"for ~{remaining:.2f} m ({steps} steps) using last_dist={last_dist:.2f} m.")
                     for _ in range(steps):
                         move_wheels(VELOCITY, VELOCITY)
                         robot.step(TIME_STEP)
@@ -475,7 +477,6 @@ def run_robot():
 
         elif tag_id == 1:
             # Right 90 degrees or left 90 depending on your observed direction.
-            # Currently: negative angle. If this is visually "left", swap signs.
             print("ID 1: Turning right 90 degrees (-π/2 radians).")
             turn_relative(robot, -math.pi / 2.0)
 
