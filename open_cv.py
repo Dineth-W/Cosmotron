@@ -155,9 +155,9 @@ def turn_to_heading(robot, target_yaw, tol=0.1, kp=1.0, max_steps=200):
             break
 
         # Proportional control for turn speed
-        turn_speed = kp * dtheta  # positive dtheta -> turn left, negative -> right
+        turn_speed = kp * dtheta  # sign of dtheta controls direction
 
-        # Turn in place: left = -ω, right = +ω
+        # Turn in place: (your robot config) left = turn_speed, right = -turn_speed
         left = turn_speed
         right = -turn_speed
 
@@ -175,7 +175,9 @@ def turn_to_heading(robot, target_yaw, tol=0.1, kp=1.0, max_steps=200):
 def turn_relative(robot, delta_angle, tol=0.5):
     """
     Turn the rover by delta_angle (radians) relative to current yaw.
-    Positive -> left (CCW), Negative -> right (CW).
+    Positive -> one turn direction, Negative -> opposite.
+    (In your current setup: check in sim which side is right/left and
+     choose signs for ID 1 and ID 2 accordingly.)
     """
     current_yaw = get_yaw()
     target_yaw = (current_yaw + delta_angle) % (2 * math.pi)
@@ -185,11 +187,24 @@ def turn_relative(robot, delta_angle, tol=0.5):
 def approach_tag(robot, camera, at_detector, camera_params, target_id, desired_stop_dist):
     """
     Move towards the tag using CAMERA distance in a feedback loop.
-    - Re-detects the tag each cycle.
-    - Keeps it centered.
-    - Stops when measured distance ~= desired_stop_dist (within WAYPOINT_TOLERANCE).
+
+    Key behavior for partial / blocked tags:
+    - While the tag is visible: keep recentering and using its distance.
+    - Once we've seen the tag at least once, if it later becomes partially
+      blocked or disappears (close to it), we:
+        * do NOT spin to search again,
+        * instead, use the last known distance to drive forward in open loop
+          to roughly reach the desired_stop_dist.
+
+    This way the rover can complete the approach even if the tag is only
+    partially visible or moves out of the frame near the end.
     """
     lost_counter = 0
+    seen_once = False
+    last_dist = None
+
+    # Approximate distance the rover moves in one "open-loop" step (meters)
+    approx_step_dist = 0.05
 
     while robot.step(TIME_STEP) != -1:
         image_data = camera.getImage()
@@ -208,44 +223,77 @@ def approach_tag(robot, camera, at_detector, camera_params, target_id, desired_s
 
         detections = [d for d in detections if d.tag_id == target_id]
 
-        if not detections:
-            lost_counter += 1
-            print(f"[Approach] Tag {target_id} lost ({lost_counter}).")
-            if lost_counter > 10:
-                print("[Approach] Tag lost for too long, stopping.")
+        # --- CASE 1: Tag visible in this frame ---
+        if detections:
+            lost_counter = 0
+            seen_once = True
+
+            selected_tag, _, dist = select_nearest_tag(detections, camera_params, TAG_SIZE)
+            if selected_tag is None or not np.isfinite(dist):
+                print("[Approach] Invalid distance from tag, skipping step.")
+                continue
+
+            last_dist = dist  # remember the most recent valid distance
+
+            # Keep it centered
+            centered = rotate_to_center(robot, selected_tag, camera)
+            if not centered:
+                # rotate_to_center already stepped the robot
+                continue
+
+            print(f"[Approach] Tag {target_id}: dist={dist:.3f} m, target={desired_stop_dist:.3f} m")
+
+            # Check if we reached the desired distance
+            if dist <= desired_stop_dist + WAYPOINT_TOLERANCE:
+                print("[Approach] Reached desired stop distance from tag.")
                 move_wheels(0, 0)
+                robot.step(TIME_STEP)
                 break
 
-            # Slow rotate to search again
-            move_wheels(0.2 * MAX_WHEEL_VELOCITY, -0.2 * MAX_WHEEL_VELOCITY)
-            continue
+            # Still far: move a bit forward under feedback
+            move_wheels(VELOCITY, VELOCITY)
+            for _ in range(2):
+                robot.step(TIME_STEP)
 
-        lost_counter = 0
+        # --- CASE 2: Tag NOT visible in this frame ---
+        else:
+            # Never seen the tag at all in this approach -> classic search
+            if not seen_once:
+                lost_counter += 1
+                print(f"[Approach] Tag {target_id} not yet seen (lost_count={lost_counter}). Searching...")
+                if lost_counter > 10:
+                    print("[Approach] Could not see tag at all, aborting approach.")
+                    move_wheels(0, 0)
+                    break
+                # Slow rotate to search again
+                move_wheels(0.2 * MAX_WHEEL_VELOCITY, -0.2 * MAX_WHEEL_VELOCITY)
+                continue
 
-        selected_tag, _, dist = select_nearest_tag(detections, camera_params, TAG_SIZE)
-        if selected_tag is None or not np.isfinite(dist):
-            print("[Approach] Invalid distance from tag, skipping step.")
-            continue
+            # We HAVE seen the tag before: now it's partially blocked or out of FOV.
+            lost_counter += 1
+            print(f"[Approach] Tag {target_id} temporarily lost after being seen.")
 
-        # Keep it centered
-        centered = rotate_to_center(robot, selected_tag, camera)
-        if not centered:
-            # rotate_to_center already stepped the robot
-            continue
+            # If it's only a short glitch, gently keep going forward (no spinning)
+            # if lost_counter <= 5:
+            #     move_wheels(VELOCITY * 0.5, VELOCITY * 0.5)
+            #     robot.step(TIME_STEP)
+            #     continue
 
-        print(f"[Approach] Tag {target_id}: dist={dist:.3f} m, target={desired_stop_dist:.3f} m")
+            # Lost for a longer time but we had a last valid distance -> finish open-loop
+            if last_dist is not None:
+                remaining = max(0.0, last_dist - desired_stop_dist)
+                if remaining > 0.0:
+                    steps = int(remaining / approx_step_dist)
+                    print(f"[Approach] Finishing in open-loop for ~{remaining:.2f} m "
+                          f"({steps} steps) using last_dist={last_dist:.2f} m.")
+                    for _ in range(steps):
+                        move_wheels(VELOCITY, VELOCITY)
+                        robot.step(TIME_STEP)
 
-        # Check if we reached the desired distance
-        if dist <= desired_stop_dist + WAYPOINT_TOLERANCE:
-            print("[Approach] Reached desired stop distance from tag.")
+            # After open-loop finish, stop the approach
             move_wheels(0, 0)
             robot.step(TIME_STEP)
             break
-
-        # Move a bit forward
-        move_wheels(VELOCITY, VELOCITY)
-        for _ in range(2):
-            robot.step(TIME_STEP)
 
     move_wheels(0, 0)
 
@@ -405,7 +453,7 @@ def run_robot():
             move_wheels(0, 0)
             break
 
-        # --- APPROACH TAG USING CAMERA DISTANCE FEEDBACK ---
+        # --- APPROACH TAG USING CAMERA DISTANCE FEEDBACK + OPEN-LOOP NEARBY ---
         if tag_id == 0:
             desired_stop_dist = 1.4
         else:
@@ -426,12 +474,13 @@ def run_robot():
             break  # final tag behavior (arrival marker)
 
         elif tag_id == 1:
-            # Right 90 degrees -> -π/2 radians
+            # Right 90 degrees or left 90 depending on your observed direction.
+            # Currently: negative angle. If this is visually "left", swap signs.
             print("ID 1: Turning right 90 degrees (-π/2 radians).")
             turn_relative(robot, -math.pi / 2.0)
 
         elif tag_id == 2:
-            # Left 90 degrees -> +π/2 radians
+            # Left 90 degrees or right 90 depending on your observed direction.
             print("ID 2: Turning left 90 degrees (+π/2 radians).")
             turn_relative(robot, math.pi / 2.0)
 
