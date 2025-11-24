@@ -1,7 +1,7 @@
 import numpy as np
 import cv2
 from pupil_apriltags import Detector
-from controller import Robot, Camera, Motor
+from controller import Robot, Camera, Motor, InertialUnit
 import math
 import sys
 
@@ -10,9 +10,10 @@ TIME_STEP = 640
 VELOCITY = 800             # logical speed, will be clamped to motor max
 MAX_SPEED = 2000.0         # logical max for turns, also clamped
 TAG_FAMILY = "tag25h9"
-TAG_SIZE = 0.20            # meters
+TAG_SIZE = 0.50            # meters
 TARGET_TAG_IDS = [0, 1, 2]
 WAYPOINT_TOLERANCE = 0.02  # meters
+MAX_TAG_VISITS = 5         # visit ~5 tags total (IDs can repeat)
 
 # MOTOR NAMES
 JOINT_NAMES = [
@@ -24,6 +25,7 @@ JOINT_NAMES = [
 
 joints = {}
 MAX_WHEEL_VELOCITY = 1.0   # will be overwritten from motors
+imu = None                 # InertialUnit (for yaw)
 
 
 def move_wheels(left_speed, right_speed):
@@ -120,45 +122,64 @@ def rotate_to_center(robot, tag, camera, tolerance=10):
         return False
 
 
-def turn_to_heading(robot, current_yaw, target_yaw, turn_gain=1800, tol=0.1, max_steps=40):
+def get_yaw():
     """
-    Turn in-place to approximately reach target_yaw from current_yaw.
-    Includes guards against NaN / inf so int() never crashes.
-    Speeds are clamped to MAX_WHEEL_VELOCITY via move_wheels().
+    Return current yaw (heading around vertical axis) from the InertialUnit.
+    If IMU is missing, returns 0.0 so code still runs (turns will be approximate).
     """
-    dtheta = ((target_yaw - current_yaw + np.pi) % (2 * np.pi)) - np.pi
+    global imu
+    if imu is None:
+        return 0.0
+    try:
+        roll, pitch, yaw = imu.getRollPitchYaw()
+        return float(yaw)
+    except Exception:
+        return 0.0
 
-    # Safety: avoid non-finite angles
-    if not np.isfinite(dtheta):
-        print(f"[WARN] Non-finite dtheta in turn_to_heading "
-              f"(current={current_yaw}, target={target_yaw}). Skipping turn.")
-        move_wheels(0, 0)
-        robot.step(TIME_STEP)
-        return
 
-    if abs(dtheta) < tol:
-        move_wheels(0, 0)
-        return
+def turn_to_heading(robot, target_yaw, tol=0.1, kp=1.0, max_steps=200):
+    """
+    Turn in-place until IMU yaw is close to target_yaw (in radians).
+    Uses a simple P-controller on heading error.
+    """
+    global MAX_WHEEL_VELOCITY
 
-    # Compute approximate number of step cycles, with safety clamps
-    raw_steps = abs(dtheta) / 0.15
-    if not np.isfinite(raw_steps) or raw_steps <= 0:
-        steps = 1
-    else:
-        steps = int(raw_steps) + 1
+    for step in range(max_steps):
+        current_yaw = get_yaw()
 
-    steps = max(1, min(steps, max_steps))
-    sign = np.sign(dtheta) if dtheta != 0 else 0
+        # Wrap smallest angular difference into [-pi, pi]
+        dtheta = ((target_yaw - current_yaw + math.pi) % (2 * math.pi)) - math.pi
 
-    print(f"Turning: dtheta={dtheta:.3f} rad, steps={steps}, sign={sign}")
+        if abs(dtheta) < tol:
+            print(f"[turn_to_heading] Reached target yaw. dtheta={dtheta:.3f} rad")
+            break
 
-    for _ in range(steps):
-        # turn_gain is logical, move_wheels will clamp to MAX_WHEEL_VELOCITY
-        move_wheels(sign * turn_gain, -sign * turn_gain)
+        # Proportional control for turn speed
+        turn_speed = kp * dtheta  # positive dtheta -> turn left, negative -> right
+
+        # Turn in place: left = -ω, right = +ω
+        left = turn_speed
+        right = -turn_speed
+
+        # Clamp to motor limits
+        left = float(np.clip(left, -MAX_WHEEL_VELOCITY, MAX_WHEEL_VELOCITY))
+        right = float(np.clip(right, -MAX_WHEEL_VELOCITY, MAX_WHEEL_VELOCITY))
+
+        move_wheels(left, right)
         robot.step(TIME_STEP)
 
     move_wheels(0, 0)
     robot.step(TIME_STEP)
+
+
+def turn_relative(robot, delta_angle, tol=0.5):
+    """
+    Turn the rover by delta_angle (radians) relative to current yaw.
+    Positive -> left (CCW), Negative -> right (CW).
+    """
+    current_yaw = get_yaw()
+    target_yaw = (current_yaw + delta_angle) % (2 * math.pi)
+    turn_to_heading(robot, target_yaw, tol=tol)
 
 
 def approach_tag(robot, camera, at_detector, camera_params, target_id, desired_stop_dist):
@@ -230,10 +251,19 @@ def approach_tag(robot, camera, at_detector, camera_params, target_id, desired_s
 
 
 def run_robot():
-    global MAX_WHEEL_VELOCITY
+    global MAX_WHEEL_VELOCITY, imu
 
     robot = Robot()
     time_step = int(robot.getBasicTimeStep())
+
+    # --- InertialUnit (IMU) ---
+    try:
+        imu = robot.getDevice("inertial unit")  # name must match your Webots world
+        imu.enable(time_step)
+        print("[INFO] InertialUnit found and enabled.")
+    except Exception as e:
+        imu = None
+        print(f"[WARN] InertialUnit not found: {e}. Using fallback yaw=0.")
 
     # Device Initialization
     for name in JOINT_NAMES:
@@ -275,7 +305,7 @@ def run_robot():
     print(f"[INFO] Detected MAX_WHEEL_VELOCITY = {MAX_WHEEL_VELOCITY}")
 
     # Camera intrinsics: (fx, fy, cx, cy)
-    # Better: compute fx, fy from Webots FOV instead of hard-coded 600
+    # Compute fx, fy from Webots FOV
     width = camera.getWidth()
     height = camera.getHeight()
     fov = camera.getFov()  # horizontal FOV in radians
@@ -296,19 +326,18 @@ def run_robot():
     )
 
     # --- STATE (optional, just for logging) ---
-    rover_x, rover_y, rover_yaw = 0.0, 0.0, 0.0
-    visited_tags = set()
+    rover_x, rover_y = 0.0, 0.0
 
     print("Starting multi-tag mission...")
 
-    # Try to handle up to len(TARGET_TAG_IDS) tags
-    for mission_step in range(len(TARGET_TAG_IDS)):
+    # Visit up to MAX_TAG_VISITS tags (IDs can repeat)
+    for mission_step in range(MAX_TAG_VISITS):
         print(f"\n=== Mission step {mission_step + 1} ===")
         found_tag = False
         tag_id = None
         measured_dist = None
 
-        # --- SEARCH FOR NEXT UNVISITED TAG ---
+        # --- SEARCH FOR NEXT TAG (ID 0, 1, or 2) ---
         search_loops = 0
         while robot.step(time_step) != -1 and not found_tag:
             search_loops += 1
@@ -335,10 +364,10 @@ def run_robot():
                     camera_params=camera_params,
                     tag_size=TAG_SIZE
                 )
-                # Only consider desired IDs and not-yet-visited tags
+                # Only consider desired IDs (allow repeated IDs; no visited filter)
                 detections = [
                     d for d in detections
-                    if d.tag_id in TARGET_TAG_IDS and d.tag_id not in visited_tags
+                    if d.tag_id in TARGET_TAG_IDS
                 ]
 
                 if detections:
@@ -357,9 +386,11 @@ def run_robot():
                 measured_dist = float(selected_dist)
                 tag_id = selected_id
 
+                current_yaw = get_yaw()
                 print(
                     f"\n--- Tag acquired (camera-based distance) ---\n"
-                    f"Rover approx pose (x={rover_x:.2f}, y={rover_y:.2f}), heading={rover_yaw:.2f} rad.\n"
+                    f"Rover approx pose (x={rover_x:.2f}, y={rover_y:.2f}), "
+                    f"heading={current_yaw:.2f} rad.\n"
                     f"Tag_id: {tag_id}, measured_dist={measured_dist:.2f} m\n"
                 )
 
@@ -376,40 +407,37 @@ def run_robot():
 
         # --- APPROACH TAG USING CAMERA DISTANCE FEEDBACK ---
         if tag_id == 0:
-            desired_stop_dist = 1.5
+            desired_stop_dist = 1.4
         else:
             desired_stop_dist = 1.0
 
         print(f"Approaching tag {tag_id} to stop at ~{desired_stop_dist} m.")
         approach_tag(robot, camera, at_detector, camera_params, tag_id, desired_stop_dist)
 
-        # --- Optional: heading changes based on tag ---
-        # For now, we just do your old behaviors (turn 180, etc.)
-        print("At goal relative to tag, aligning 180° from approach direction...")
-        new_yaw = (rover_yaw + np.pi) % (2 * np.pi)
-        turn_to_heading(robot, rover_yaw, new_yaw)
-        rover_yaw = new_yaw
-
+        # ========== SIMPLE TAG-BASED ROTATIONS (NO FINE-ALIGN) ==========
         if tag_id == 0:
-            print("ID 0: STOPPING at 1.5 m before tag, facing opposite direction. Mission ends here.")
+            # 180 degrees -> π radians
+            print("ID 0: Turning 180 degrees (π radians).")
+            turn_relative(robot, math.pi)
+
+            print("ID 0: STOPPING at ~desired distance before tag, facing opposite direction. Mission ends here.")
             move_wheels(0, 0)
             robot.step(TIME_STEP)
-            visited_tags.add(tag_id)
-            break  # final tag behavior
+            break  # final tag behavior (arrival marker)
+
         elif tag_id == 1:
-            print("ID 1: Performing 90° right turn.")
-            target_yaw = (rover_yaw - np.pi / 2.0) % (2 * np.pi)
-            turn_to_heading(robot, rover_yaw, target_yaw)
-            rover_yaw = target_yaw
+            # Right 90 degrees -> -π/2 radians
+            print("ID 1: Turning right 90 degrees (-π/2 radians).")
+            turn_relative(robot, -math.pi / 2.0)
+
         elif tag_id == 2:
-            print("ID 2: Performing 90° left turn.")
-            target_yaw = (rover_yaw + np.pi / 2.0) % (2 * np.pi)
-            turn_to_heading(robot, rover_yaw, target_yaw)
-            rover_yaw = target_yaw
+            # Left 90 degrees -> +π/2 radians
+            print("ID 2: Turning left 90 degrees (+π/2 radians).")
+            turn_relative(robot, math.pi / 2.0)
+
         else:
             print(f"Tag {tag_id} has no special behavior. Continuing.")
 
-        visited_tags.add(tag_id)
         print(f"Finished behavior for tag {tag_id}. Looking for next tag...")
 
     print("Mission complete. No more tags or mission steps.")
