@@ -29,7 +29,7 @@ MAX_WHEEL_VELOCITY = 1.0   # will be overwritten from motors
 def move_wheels(left_speed, right_speed):
     """
     Set wheel speeds, clamped so we never exceed Webots 'maxVelocity'.
-    This prevents console warnings like 'requested velocity exceeds maxVelocity'.
+    This prevents console warnings like  'requested velocity exceeds maxVelocity'.
     """
     global MAX_WHEEL_VELOCITY
     ls = float(np.clip(left_speed, -MAX_WHEEL_VELOCITY, MAX_WHEEL_VELOCITY))
@@ -376,46 +376,91 @@ def run_robot():
 
         # --- APPROACH TAG USING CAMERA DISTANCE FEEDBACK ---
         if tag_id == 0:
-            desired_stop_dist = 0.5
+            desired_stop_dist = 0.9
         else:
-            desired_stop_dist = 0.5
+            desired_stop_dist = 0.9
 
         print(f"Approaching tag {tag_id} to stop at ~{desired_stop_dist} m.")
         approach_tag(robot, camera, at_detector, camera_params, tag_id, desired_stop_dist)
 
-        # --- Tag-based rotations (in radians) ---
-        if tag_id == 0:
-            # 180 degrees -> π radians
-            print("ID 0: Turning 180 degrees (π radians).")
-            target_yaw = (rover_yaw + math.pi) % (2 * math.pi)
-            turn_to_heading(robot, rover_yaw, target_yaw)
-            rover_yaw = target_yaw
-
-            print("ID 0: STOPPING at 0.3 m before tag, facing opposite direction. Mission ends here.")
-            move_wheels(0, 0)
-            robot.step(TIME_STEP)
-            visited_tags.add(tag_id)
-            break  # final tag behavior
-
-        elif tag_id == 1:
-            # Right 90 degrees -> -π/2 radians
-            print("ID 1: Turning right 90 degrees (-π/2 radians).")
-            target_yaw = (rover_yaw - (math.pi / 2.0)) % (2 * math.pi)
-            turn_to_heading(robot, rover_yaw, target_yaw)
-            rover_yaw = target_yaw
-
-        elif tag_id == 2:
-            # Left 90 degrees -> +π/2 radians
-            print("ID 2: Turning left 90 degrees (+π/2 radians).")
-            target_yaw = (rover_yaw + (math.pi / 2.0)) % (2 * math.pi)
-            turn_to_heading(robot, rover_yaw, target_yaw)
-            rover_yaw = target_yaw
-
+        image_data = camera.getImage()
+        gray = webots_to_opencv(image_data, camera.getWidth(), camera.getHeight())
+        detections = at_detector.detect(
+            gray,
+            estimate_tag_pose=True,
+            camera_params=camera_params,
+            tag_size=TAG_SIZE
+        )
+        detections = [d for d in detections if d.tag_id == tag_id]
+        if not detections:
+            print("Tag not found for precise alignment")
         else:
-            print(f"Tag {tag_id} has no special behavior. Continuing.")
+            selected_tag, _, dist = select_nearest_tag(detections, camera_params, TAG_SIZE)
+            if selected_tag and getattr(selected_tag, "pose_t", None) is not None:
+                tx, ty, tz = selected_tag.pose_t
+                theta = math.atan2(tx, tz)
+                print(f"Aligning, theta={math.degrees(theta):.2f}°")
+                turn_to_heading(robot, rover_yaw, rover_yaw - theta)
+                rover_yaw = (rover_yaw - theta) % (2 * math.pi)
 
-        visited_tags.add(tag_id)
-        print(f"Finished behavior for tag {tag_id}. Looking for next tag...")
+                r = math.sqrt(tx**2 + tz**2)
+                lateral_offset = r * math.sin(theta)
+                print(f"Lateral offset: {lateral_offset:.3f} m")
+                if abs(lateral_offset) > 0.01:
+                    turn_sign = np.sign(theta)
+                    turn90 = math.pi/2 * turn_sign
+                    target_yaw = (rover_yaw + turn90) % (2 * math.pi)
+                    turn_to_heading(robot, rover_yaw, target_yaw)
+                    rover_yaw = target_yaw
+
+                    move_wheels(VELOCITY, VELOCITY)
+                    drive_time = abs(lateral_offset) / (VELOCITY * 0.01)
+                    for _ in range(int(drive_time)):
+                        robot.step(TIME_STEP)
+                    move_wheels(0, 0)
+
+                    target_yaw = (rover_yaw - turn90) % (2 * math.pi)
+                    turn_to_heading(robot, rover_yaw, target_yaw)
+                    rover_yaw = target_yaw
+
+                # Optional: face the tag again (may not be needed if previous step did it)
+                print("Final 90° turn to face the tag")
+                target_yaw = (rover_yaw + math.pi/2) % (2 * math.pi)
+                turn_to_heading(robot, rover_yaw, target_yaw)
+                rover_yaw = target_yaw
+            # --- Tag-based rotations (in radians) ---
+            if tag_id == 0:
+                # 180 degrees -> π radians
+                print("ID 0: Turning 180 degrees (π radians).")
+                target_yaw = (rover_yaw + math.pi) % (2 * math.pi)
+                turn_to_heading(robot, rover_yaw, target_yaw)
+                rover_yaw = target_yaw
+
+                print("ID 0: STOPPING at 0.3 m before tag, facing opposite direction. Mission ends here.")
+                move_wheels(0, 0)
+                robot.step(TIME_STEP)
+                visited_tags.add(tag_id)
+                break  # final tag behavior
+
+            elif tag_id == 1:
+                # Right 90 degrees -> -π/2 radians
+                print("ID 1: Turning right 90 degrees (-π/2 radians).")
+                target_yaw = (rover_yaw - (math.pi / 2.0)) % (2 * math.pi)
+                turn_to_heading(robot, rover_yaw, target_yaw)
+                rover_yaw = target_yaw
+
+            elif tag_id == 2:
+                # Left 90 degrees -> +π/2 radians
+                print("ID 2: Turning left 90 degrees (+π/2 radians).")
+                target_yaw = (rover_yaw + (math.pi / 2.0)) % (2 * math.pi)
+                turn_to_heading(robot, rover_yaw, target_yaw)
+                rover_yaw = target_yaw
+
+            else:
+                print(f"Tag {tag_id} has no special behavior. Continuing.")
+
+            visited_tags.add(tag_id)
+            print(f"Finished behavior for tag {tag_id}. Looking for next tag...")
 
     print("Mission complete. No more tags or mission steps.")
     move_wheels(0, 0)
