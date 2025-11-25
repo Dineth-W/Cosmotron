@@ -1,0 +1,181 @@
+from controller import Robot
+
+# --- CONSTANTS ---
+ARM_FRONT_CARDBOARD_BOX = [0.0, -0.5, 1.0, -1.5, 0.0]
+ARM_RESET               = [0.0, 0.0, 0.0, 0.0, 0.0] 
+ARM_FOLDED              = [0.0, -1.9, 0.1, 0.1, 0.0] 
+
+# --- CLASS DEFINITION ---
+class YouBot(Robot):
+    def __init__(self):
+        super(YouBot, self).__init__()
+        self.timestep = int(self.getBasicTimeStep())
+
+        self.receiver = self.getDevice("receiver")
+        if self.receiver:
+            self.receiver.enable(self.timestep)
+            self.receiver.setChannel(1) # Listen on channel 1
+
+        # --- CAMERA INIT ---
+        self.cam = self.getDevice('gripper_camera')
+        if self.cam:
+            self.cam.enable(self.timestep)
+
+        # --- ARM MOTORS INIT ---
+        self.arm_motors = []
+        for i in range(1, 6):
+            motor = self.getDevice(f'arm{i}')
+            self.arm_motors.append(motor)
+
+        # --- ROBOTIQ 3F GRIPPER INIT ---
+        self.gripper_motors = {}
+        
+        # Define the motors
+        target_names = [
+            "palm_finger_1_joint", "palm_finger_2_joint", # Scissor joints
+            "finger_1_joint_1", "finger_1_joint_2", "finger_1_joint_3",
+            "finger_2_joint_1", "finger_2_joint_2", "finger_2_joint_3",
+            "finger_middle_joint_1", "finger_middle_joint_2", "finger_middle_joint_3"
+        ]
+
+        for name in target_names:
+            device = self.getDevice(name)
+            if device:
+                self.gripper_motors[name] = device
+                
+                # --- FIX FOR AGGRESSIVE GRIP ---
+                # 1. Slow down the fingers so they don't slap the rock
+                device.setVelocity(0.5)  # Default is often > 1.0
+                
+                # 2. Limit the strength (Torque) of the curling fingers
+                # If "palm" is NOT in the name, it's a curling joint.
+                if "palm" not in name:
+                    # Set max torque low (e.g., 0.1 to 0.5 Newton-meters)
+                    # Adjust this value: 
+                    # 0.1 = Very gentle (might drop heavy rocks)
+                    # 0.4 = Medium grip
+                    # 1.0+ = Crushing grip
+                    device.setAvailableTorque(0.6) 
+
+    def step_sim(self):
+        if self.step(self.timestep) == -1:
+            exit(0)
+
+    def passive_wait(self, seconds):
+        start = self.getTime()
+        while self.getTime() < start + seconds:
+            self.step_sim()
+    
+    def wait_for_start_signal(self):
+        print("Arm is in standby. Waiting for Rover signal...")
+        
+        while True:
+            # Check if there is a message in the queue
+            if self.receiver.getQueueLength() > 0:
+                # Read the message
+                #message = self.receiver.getData().decode('utf-8')
+                message = self.receiver.getString() 
+                self.receiver.nextPacket() # Discard packet after reading
+                
+                if message == "START_ARM":
+                    print("Signal received! Activating Arm.")
+                    break # Exit the loop and continue program
+            
+            # Keep simulation running while waiting
+            self.step_sim()
+            
+            
+    # --- ROBOTIQ GRIPPER FUNCTIONS ---
+    def gripper_grip(self):
+        """Closes the 3F gripper gently around an object."""
+        
+        # When gripping, we want the motors to be weak (compliant)
+        for name, motor in self.gripper_motors.items():
+            if "palm" not in name:
+                motor.setAvailableTorque(0.5) # Ensure torque is low for gripping
+
+        for name, motor in self.gripper_motors.items():
+            # Scissor joints: Keep straight
+            if "palm" in name:
+                motor.setPosition(0.0)
+            
+            # Joint 1 (Knuckles): The main closing force
+            elif "joint_1" in name:
+                motor.setPosition(0.65) # Target slightly less than full close
+                
+            # Joint 2 (Middle):
+            elif "joint_2" in name:
+                motor.setPosition(0.5) 
+
+            # Joint 3 (Tips): Keep these loose or slightly negative
+            # Setting them to a loose position allows the rock to push them open
+            elif "joint_3" in name:
+                motor.setPosition(-0.04)
+
+    def gripper_release(self):
+        """Opens the 3F gripper."""
+        
+        # When opening, we can use more power to ensure it actually opens
+        for name, motor in self.gripper_motors.items():
+            motor.setAvailableTorque(1.0) # Restore torque to open reliably
+            
+            if "palm" not in name:
+                motor.setPosition(0.0)
+
+    # --- ARM FUNCTIONS ---
+    def arm_set_height(self, pose):
+        for i in range(1, 5):
+            self.arm_motors[i].setPosition(pose[i])
+            
+    def arm_set_orientation(self, angle):
+        self.arm_motors[0].setPosition(angle)
+    
+    def arm_set_rotate(self, motor_id, angle):
+        index = motor_id - 1 
+        if 0 <= index < len(self.arm_motors):
+            self.arm_motors[index].setPosition(angle)
+    
+    def arm_reset(self):
+        self.arm_set_height(ARM_RESET)
+        
+    def arm_fold(self):
+        self.arm_set_height(ARM_FOLDED)
+
+    # --- AUTOMATIC BEHAVIOR ---
+    def run_automatic_behavior(self):
+        print("Starting Automatic Behavior...")
+        
+        self.gripper_release()
+        self.passive_wait(1.0)
+        
+        print("Gripping Rock Gently...")
+        self.gripper_grip()
+        self.passive_wait(2.0)
+        
+        # Lift slightly to check grip
+        print("Lifting...")
+        self.arm_set_rotate(2, -1.12)
+        self.passive_wait(2.0)
+        self.arm_set_rotate(3, -0.5)
+        self.passive_wait(2.0)
+        
+        print("Rotating...")
+        self.arm_set_rotate(1, 3.14)
+        self.passive_wait(3.0)
+
+        print("Releasing...")
+        self.gripper_release()
+        self.arm_set_height(ARM_FOLDED)
+        
+        print("Behavior Complete.")
+
+# --- MAIN EXECUTION ---
+if __name__ == "__main__":
+    bot = YouBot()
+    
+    bot.wait_for_start_signal()
+    bot.passive_wait(1.0)
+    bot.run_automatic_behavior()
+    
+    while True:
+        bot.step_sim()
