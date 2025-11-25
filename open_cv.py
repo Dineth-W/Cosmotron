@@ -5,6 +5,9 @@ from controller import Robot, Camera, Motor, InertialUnit
 import math
 import sys
 
+
+# TODO Fix the clash between
+
 # GLOBAL CONSTANTS
 TIME_STEP = 640
 VELOCITY = 800             # logical speed, will be clamped to motor max
@@ -26,6 +29,12 @@ JOINT_NAMES = [
 joints = {}
 MAX_WHEEL_VELOCITY = 1.0   # will be overwritten from motors
 imu = None                 # InertialUnit (for yaw)
+
+# --- NEW GLOBALS FOR GROUND-AWARE YAW ---
+last_yaw = 0.0
+yaw_initialized = False
+MAX_TILT_RAD = math.radians(40.0)  # if |roll| or |pitch| > this, treat yaw carefully
+YAW_ALPHA = 0.7                    # low-pass filter factor (0..1), higher = smoother
 
 
 def move_wheels(left_speed, right_speed):
@@ -101,7 +110,7 @@ def select_nearest_tag(detections, camera_params, tag_size=TAG_SIZE):
     return selected_tag, selected_id, min_dist
 
 
-def rotate_to_center(robot, tag, camera, tolerance=10):
+def rotate_to_center(robot, tag, camera, tolerance=5):
     """
     Align robot so the detected tag is horizontally centered in the CAMERA image.
     """
@@ -124,20 +133,48 @@ def rotate_to_center(robot, tag, camera, tolerance=10):
 
 def get_yaw():
     """
-    Return current yaw (heading around vertical axis) from the InertialUnit.
-    If IMU is missing, returns 0.0 so code still runs (turns will be approximate).
+    Return a 'ground-aware' yaw (heading) using the InertialUnit.
+
+    - Uses roll, pitch, yaw from imu.getRollPitchYaw().
+    - Unwraps yaw to avoid +/-pi jumps.
+    - If roll/pitch are very large (robot is strongly tilted), we freeze yaw
+      to the last stable value instead of trusting the noisy reading.
+    - Otherwise we low-pass filter yaw so the heading used for control is smooth.
     """
-    global imu
+    global imu, last_yaw, yaw_initialized, MAX_TILT_RAD, YAW_ALPHA
+
     if imu is None:
-        return 0.0
+        return last_yaw
+
     try:
-        roll, pitch, yaw = imu.getRollPitchYaw()
-        return float(yaw)
+        roll, pitch, yaw = imu.getRollPitchYaw()  # all in radians
+
+        if not yaw_initialized:
+            last_yaw = float(yaw)
+            yaw_initialized = True
+            return last_yaw
+
+        # --- unwrap yaw around last_yaw to avoid 2π jumps ---
+        dyaw = ((yaw - last_yaw + math.pi) % (2 * math.pi)) - math.pi
+        yaw_unwrapped = last_yaw + dyaw
+
+        # --- use roll & pitch to decide how much we trust this yaw ---
+        if abs(roll) > MAX_TILT_RAD or abs(pitch) > MAX_TILT_RAD:
+            # robot is heavily tilted → yaw can be noisy; freeze at last_yaw
+            yaw_ground = last_yaw
+        else:
+            # smooth / filter yaw so uneven ground doesn't cause big heading jumps
+            yaw_ground = YAW_ALPHA * last_yaw + (1.0 - YAW_ALPHA) * yaw_unwrapped
+
+        last_yaw = float(yaw_ground)
+        return last_yaw
+
     except Exception:
-        return 0.0
+        # if anything goes wrong, just reuse last yaw
+        return last_yaw
 
 
-def turn_to_heading(robot, target_yaw, tol=0.1, kp=1.0, max_steps=200):
+def turn_to_heading(robot, target_yaw, tol=0.05, kp=1.0, max_steps=200):
     """
     Turn in-place until IMU yaw is close to target_yaw (in radians).
     Uses a simple P-controller on heading error.
@@ -157,7 +194,7 @@ def turn_to_heading(robot, target_yaw, tol=0.1, kp=1.0, max_steps=200):
         # Proportional control for turn speed
         turn_speed = kp * dtheta  # sign of dtheta controls direction
 
-        # Turn in place: (your robot config) left = turn_speed, right = -turn_speed
+        # Turn in place: left = turn_speed, right = -turn_speed
         left = turn_speed
         right = -turn_speed
 
@@ -172,7 +209,7 @@ def turn_to_heading(robot, target_yaw, tol=0.1, kp=1.0, max_steps=200):
     robot.step(TIME_STEP)
 
 
-def turn_relative(robot, delta_angle, tol=0.5):
+def turn_relative(robot, delta_angle, tol=0.05):
     """
     Turn the rover by delta_angle (radians) relative to current yaw.
     Positive -> one turn direction, Negative -> opposite.
@@ -205,7 +242,7 @@ def approach_tag(robot, camera, at_detector, camera_params, target_id, desired_s
     # Approximate distance the rover moves in one "open-loop" step (meters)
     approx_step_dist = 0.6
     # How many consecutive lost frames we tolerate before switching to open-loop
-    LOST_GRACE_FRAMES = 0
+    LOST_GRACE_FRAMES = 10
 
     while robot.step(TIME_STEP) != -1:
         image_data = camera.getImage()
@@ -301,7 +338,7 @@ def approach_tag(robot, camera, at_detector, camera_params, target_id, desired_s
 
 
 def run_robot():
-    global MAX_WHEEL_VELOCITY, imu
+    global MAX_WHEEL_VELOCITY, imu, last_yaw, yaw_initialized
 
     robot = Robot()
     time_step = int(robot.getBasicTimeStep())
@@ -311,6 +348,9 @@ def run_robot():
         imu = robot.getDevice("inertial unit")  # name must match your Webots world
         imu.enable(time_step)
         print("[INFO] InertialUnit found and enabled.")
+        # reset yaw filter
+        last_yaw = 0.0
+        yaw_initialized = False
     except Exception as e:
         imu = None
         print(f"[WARN] InertialUnit not found: {e}. Using fallback yaw=0.")
