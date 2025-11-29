@@ -1,9 +1,11 @@
 from controller import Robot
 
 # --- CONSTANTS ---
+CANDLE                  = [0.0 ,0.0, 0.0, 0.0, 0.0]
 ARM_FRONT_CARDBOARD_BOX = [0.0, -0.5, 1.0, -1.5, 0.0]
 ARM_RESET               = [0.0, 0.0, 0.0, 0.0, 0.0] 
-ARM_FOLDED              = [0.0, -1.9, 0.1, 0.1, 0.0] 
+ARM_FOLDED              = [0.0, -1.9, 0.1, 0.1, 0.0]
+RESTING                 = [0, 1.8, -2.6, -0.5, 0.0]
 
 # --- CLASS DEFINITION ---
 class YouBot(Robot):
@@ -92,7 +94,7 @@ class YouBot(Robot):
         # When gripping, we want the motors to be weak (compliant)
         for name, motor in self.gripper_motors.items():
             if "palm" not in name:
-                motor.setAvailableTorque(0.5) # Ensure torque is low for gripping
+                motor.setAvailableTorque(1.8) # Ensure torque is low for gripping
 
         for name, motor in self.gripper_motors.items():
             # Scissor joints: Keep straight
@@ -143,29 +145,61 @@ class YouBot(Robot):
 
     # --- AUTOMATIC BEHAVIOR ---
     def run_automatic_behavior(self):
-        print("Starting Automatic Behavior...")
+        # print("Starting Automatic Behavior...")
         
+       
+       #arm is still at rest
         self.gripper_release()
         self.passive_wait(1.0)
-        
-        print("Gripping Rock Gently...")
-        self.gripper_grip()
-        self.passive_wait(2.0)
-        
-        # Lift slightly to check grip
+        print("ARM at Rover Bed..")
+      
+      
+     # lifting from rover bed 
         print("Lifting...")
         self.arm_set_rotate(2, -1.12)
-        self.passive_wait(2.0)
-        self.arm_set_rotate(3, -0.5)
+        self.arm_set_rotate(3, 1.5)
         self.passive_wait(2.0)
         
+     # Rotaing from rover
         print("Rotating...")
-        self.arm_set_rotate(1, 3.14)
-        self.passive_wait(3.0)
+        self.arm_set_rotate(1, 3.14/2)
+        self.passive_wait(2.0)
 
-        print("Releasing...")
+    #lowering arm
+        print("Lowering arm...")
+        self.arm_set_rotate(2, -2.8)
+        #self.arm_set_height(ARM_FOLDED)
+        self.passive_wait(4.0)
+        print("Behavior Update.")
+        
+    #gripping rock
+        
+        print("Gripping...")
+        self.gripper_grip()
+        self.passive_wait(5.0)
+        
+    #lift arm 2
+        
+        print("Lifting arm...")
+        self.arm_set_rotate(2, -0.8)
+        self.passive_wait(2.0)
+        
+     # rotate to rover 2
+        print("Rotating arm...")
+        self.arm_set_rotate(3,0.7)
+        self.passive_wait(3.0)
+        self.arm_set_rotate(1,-1.57)
+        self.passive_wait(2.0) 
+        # bot.arm_set_height(CANDLE)
+        # self.passive_wait(5.0)
+        
+      # rock put
+        print("Astroid saved...")
         self.gripper_release()
-        self.arm_set_height(ARM_FOLDED)
+        self.arm_set_rotate(4,-0.4)
+        self.passive_wait(3.0)  
+        # bot.arm_set_height(RESTING)
+        # self.passive_wait(5.0)
         
         print("Behavior Complete.")
 
@@ -173,7 +207,7 @@ class YouBot(Robot):
 if __name__ == "__main__":
     bot = YouBot()
     
-    bot.wait_for_start_signal()
+    
     bot.passive_wait(1.0)
     bot.run_automatic_behavior()
     
