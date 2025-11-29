@@ -1,22 +1,26 @@
 import numpy as np
 import cv2
 from pupil_apriltags import Detector
-from controller import Robot, Camera, Motor, InertialUnit
+from controller import Robot, Camera, Motor, InertialUnit, Emitter
 import math
 import sys
 
 
-# TODO Fix the clash between
-
 # GLOBAL CONSTANTS
 TIME_STEP = 640
-VELOCITY = 3             # logical speed, will be clamped to motor max
-MAX_SPEED = 3         # logical max for turns, also clamped
+VELOCITY = 3              # logical forward speed (motor units)
+MAX_SPEED = 3             # logical max for turns (motor units)
 TAG_FAMILY = "tag25h9"
-TAG_SIZE = 0.50            # meters
+TAG_SIZE = 0.50           # meters (AprilTag side length)
 TARGET_TAG_IDS = [0, 1, 2]
-WAYPOINT_TOLERANCE = 0.02  # meters
-MAX_TAG_VISITS = 5         # visit ~5 tags total (IDs can repeat)
+WAYPOINT_TOLERANCE = 0.02 # meters
+MAX_TAG_VISITS = 5        # visit ~5 tags total (IDs can repeat)
+
+# White circle properties (for arm_camera alignment)
+WHITE_CIRCLE_DIAMETER = 0.20      # meters (adjust to your real circle size)
+TARGET_CIRCLE_DISTANCE = 0.25     # meters (25 cm from circle)
+CIRCLE_CENTER_TOL_PX = 10         # pixels tolerance for centering
+CIRCLE_DIST_TOL_M   = 0.02        # ±2 cm distance tolerance
 
 # MOTOR NAMES
 JOINT_NAMES = [
@@ -28,19 +32,22 @@ JOINT_NAMES = [
 
 joints = {}
 MAX_WHEEL_VELOCITY = 3.0   # will be overwritten from motors
-imu = None                 # InertialUnit (for yaw)
+imu = None                 # InertialUnit (for roll/pitch/yaw)
 
-# --- NEW GLOBALS FOR GROUND-AWARE YAW ---
+# --- GLOBALS FOR GROUND-AWARE ORIENTATION ---
 last_yaw = 0.0
 yaw_initialized = False
 MAX_TILT_RAD = math.radians(40.0)  # if |roll| or |pitch| > this, treat yaw carefully
 YAW_ALPHA = 0.7                    # low-pass filter factor (0..1), higher = smoother
+last_roll = 0.0                    # last measured roll
+last_pitch = 0.0                   # last measured pitch
 
+
+# ------------- BASIC WHEEL & CAMERA HELPERS -----------------
 
 def move_wheels(left_speed, right_speed):
     """
     Set wheel speeds, clamped so we never exceed Webots 'maxVelocity'.
-    This prevents console warnings like 'requested velocity exceeds maxVelocity'.
     """
     global MAX_WHEEL_VELOCITY
     ls = float(np.clip(left_speed, -MAX_WHEEL_VELOCITY, MAX_WHEEL_VELOCITY))
@@ -55,6 +62,10 @@ def move_wheels(left_speed, right_speed):
 
 
 def wheels_straight():
+    """
+    Align steering arms so wheels point forward.
+    This helps turns be closer to 'in-place'.
+    """
     joints["FrontLeftArm"].setPosition(0.0)
     joints["FrontRightArm"].setPosition(0.0)
     joints["BackRightArm"].setPosition(0.0)
@@ -62,6 +73,10 @@ def wheels_straight():
 
 
 def webots_to_opencv(image_data, width, height):
+    """
+    Convert Webots BGRA image (bytes) to a grayscale OpenCV image.
+    Used for AprilTag detection.
+    """
     if image_data:
         np_array = np.frombuffer(image_data, np.uint8).reshape((height, width, 4))
         image_bgr = np_array[:, :, :3]
@@ -69,6 +84,20 @@ def webots_to_opencv(image_data, width, height):
         return gray_image
     return None
 
+
+def webots_to_bgr(image_data, width, height):
+    """
+    Convert Webots BGRA image (bytes) to a BGR OpenCV image.
+    Used for white-circle detection with arm_camera.
+    """
+    if image_data:
+        np_array = np.frombuffer(image_data, np.uint8).reshape((height, width, 4))
+        image_bgr = np_array[:, :, :3]
+        return image_bgr
+    return None
+
+
+# ------------- APRILTAG HELPERS -----------------
 
 def select_nearest_tag(detections, camera_params, tag_size=TAG_SIZE):
     """
@@ -131,23 +160,31 @@ def rotate_to_center(robot, tag, camera, tolerance=5):
         return False
 
 
+# ------------- ORIENTATION / TURNING (IMU + TILT AWARE) -----------------
+
 def get_yaw():
     """
     Return a 'ground-aware' yaw (heading) using the InertialUnit.
 
     - Uses roll, pitch, yaw from imu.getRollPitchYaw().
     - Unwraps yaw to avoid +/-pi jumps.
-    - If roll/pitch are very large (robot is strongly tilted), we freeze yaw
+    - If roll/pitch are very large (robot strongly tilted), we freeze yaw
       to the last stable value instead of trusting the noisy reading.
     - Otherwise we low-pass filter yaw so the heading used for control is smooth.
+
+    Also stores the latest roll and pitch in globals so turning logic can
+    react to slope/tilt and reduce sideways drifting.
     """
     global imu, last_yaw, yaw_initialized, MAX_TILT_RAD, YAW_ALPHA
+    global last_roll, last_pitch
 
     if imu is None:
         return last_yaw
 
     try:
         roll, pitch, yaw = imu.getRollPitchYaw()  # all in radians
+        last_roll = float(roll)
+        last_pitch = float(pitch)
 
         if not yaw_initialized:
             last_yaw = float(yaw)
@@ -177,9 +214,10 @@ def get_yaw():
 def turn_to_heading(robot, target_yaw, tol=0.05, kp=1.0, max_steps=200):
     """
     Turn in-place until IMU yaw is close to target_yaw (in radians).
-    Uses a simple P-controller on heading error.
+    Uses a simple P-controller on heading error, and uses roll/pitch to
+    slow down turning on slopes to reduce sideways slipping.
     """
-    global MAX_WHEEL_VELOCITY
+    global MAX_WHEEL_VELOCITY, last_roll, last_pitch, MAX_TILT_RAD
 
     for step in range(max_steps):
         current_yaw = get_yaw()
@@ -191,10 +229,20 @@ def turn_to_heading(robot, target_yaw, tol=0.05, kp=1.0, max_steps=200):
             print(f"[turn_to_heading] Reached target yaw. dtheta={dtheta:.3f} rad")
             break
 
-        # Proportional control for turn speed
-        turn_speed = kp * dtheta  # sign of dtheta controls direction
+        # --- tilt-aware speed scaling ---
+        # magnitude of tilt (combined roll & pitch)
+        tilt = math.sqrt(last_roll ** 2 + last_pitch ** 2)
+        if tilt >= MAX_TILT_RAD:
+            # very tilted → turn slowly
+            tilt_factor = 0.3
+        else:
+            # from 1.0 on flat to ~0.3 at MAX_TILT_RAD
+            tilt_factor = 1.0 - 0.7 * (tilt / MAX_TILT_RAD)
 
-        # Turn in place: left = turn_speed, right = -turn_speed
+        # Proportional control for turn speed, modulated by tilt
+        turn_speed = kp * dtheta * tilt_factor  # sign of dtheta controls direction
+
+        # Turn in place: left = +turn_speed, right = -turn_speed
         left = turn_speed
         right = -turn_speed
 
@@ -213,11 +261,14 @@ def turn_relative(robot, delta_angle, tol=0.05):
     """
     Turn the rover by delta_angle (radians) relative to current yaw.
     Positive -> one turn direction, Negative -> opposite.
+    Uses the ground-aware yaw (roll/pitch + yaw) from get_yaw().
     """
     current_yaw = get_yaw()
     target_yaw = (current_yaw + delta_angle) % (2 * math.pi)
     turn_to_heading(robot, target_yaw, tol=tol)
 
+
+# ------------- APPROACH APRILTAG -----------------
 
 def approach_tag(robot, camera, at_detector, camera_params, target_id, desired_stop_dist):
     """
@@ -320,7 +371,10 @@ def approach_tag(robot, camera, at_detector, camera_params, target_id, desired_s
             # Lost for longer than grace window and we have a last valid distance:
             # -> finish open-loop (calculated steps) and DO NOT track other tags
             if last_dist is not None:
-                remaining = max(0.0, last_dist - desired_stop_dist)
+                remaining = max(
+                    0.0,
+                    last_dist - desired_stop_dist - LOST_GRACE_FRAMES * VELOCITY * 0.5
+                )
                 if remaining > 0.0:
                     steps = int(remaining / approx_step_dist)
                     print(f"[Approach] Tag {target_id} lost for long; finishing in open-loop "
@@ -336,6 +390,129 @@ def approach_tag(robot, camera, at_detector, camera_params, target_id, desired_s
 
     move_wheels(0, 0)
 
+
+# ------------- WHITE CIRCLE DETECTION (arm_camera) -----------------
+
+def detect_white_circle(bgr_image):
+    """
+    Detect the main white circle on red background.
+    Returns (cx, cy, radius) in pixels, or None if not found.
+    """
+    if bgr_image is None:
+        return None
+
+    # Convert to HSV for better color thresholding
+    hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
+
+    # White: low saturation, high value
+    lower_white = np.array([0, 0, 200], dtype=np.uint8)
+    upper_white = np.array([180, 40, 255], dtype=np.uint8)
+    mask = cv2.inRange(hsv, lower_white, upper_white)
+
+    # Smooth mask to reduce noise
+    mask = cv2.GaussianBlur(mask, (5, 5), 0)
+
+    # Find contours
+    contours_info = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = contours_info[0] if len(contours_info) == 2 else contours_info[1]
+
+    if not contours:
+        return None
+
+    # Use largest contour as the circle candidate
+    c = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(c)
+    if area < 50:   # ignore tiny blobs
+        return None
+
+    (x, y), radius = cv2.minEnclosingCircle(c)
+    if radius < 3:  # ignore very small circles
+        return None
+
+    return (x, y, radius)
+
+
+def align_to_white_circle(robot, arm_camera, fx_arm, target_distance_m=TARGET_CIRCLE_DISTANCE*0.75,
+                          center_tolerance_px=CIRCLE_CENTER_TOL_PX,
+                          dist_tolerance_m=CIRCLE_DIST_TOL_M,
+                          max_frames=600):
+    """
+    Use arm_camera to:
+      1. Spin / move until the white circle is centered horizontally.
+      2. Adjust forward/backward distance so the estimated distance is ~target_distance_m.
+
+    Returns True if alignment succeeded, False on timeout/failure.
+    """
+    if arm_camera is None or fx_arm is None:
+        print("[AlignCircle] arm_camera or fx_arm missing. Cannot align.")
+        return False
+
+    width = arm_camera.getWidth()
+    height = arm_camera.getHeight()
+    center_x = width / 2.0
+
+    frame_count = 0
+    print("[AlignCircle] Starting alignment using arm_camera...")
+
+    while robot.step(TIME_STEP) != -1:
+        frame_count += 1
+        if frame_count > max_frames:
+            print("[AlignCircle] Timeout while trying to align to white circle.")
+            move_wheels(0, 0)
+            return False
+
+        img_data = arm_camera.getImage()
+        bgr = webots_to_bgr(img_data, width, height)
+        if bgr is None:
+            move_wheels(0, 0)
+            continue
+
+        circle = detect_white_circle(bgr)
+        if circle is None:
+            # No circle → slowly rotate to search
+            move_wheels(-0.2 * MAX_WHEEL_VELOCITY, 0.2 * MAX_WHEEL_VELOCITY)
+            continue
+
+        cx, cy, radius = circle
+
+        # ---- STEP 1: HORIZONTAL CENTERING ----
+        offset_x = cx - center_x
+        if abs(offset_x) > center_tolerance_px:
+            # rotate to reduce horizontal offset
+            turn_speed = np.clip(0.004 * offset_x, -MAX_SPEED, MAX_SPEED)
+            move_wheels(-turn_speed, turn_speed)
+            continue
+
+        # At this point, horizontally centered → adjust distance
+        if radius <= 0:
+            move_wheels(0, 0)
+            continue
+
+        # distance ≈ (physical_diameter * fx) / (diameter_in_pixels)
+        est_dist = (WHITE_CIRCLE_DIAMETER * fx_arm) / (2.0 * radius)
+        diff = est_dist - target_distance_m
+
+        print(f"[AlignCircle] Centered. est_dist={est_dist:.3f} m, "
+              f"target={target_distance_m:.3f} m, diff={diff:.3f} m, radius_px={radius:.1f}")
+
+        if abs(diff) <= dist_tolerance_m:
+            move_wheels(0, 0)
+            print("[AlignCircle] Alignment complete: centered and at target distance.")
+            return True
+
+        # Move forward/backward depending on whether we're too far or too close
+        if diff > 0:
+            # too far → move forward
+            move_wheels(VELOCITY, VELOCITY)
+        else:
+            # too close → move backwards
+            move_wheels(-VELOCITY, -VELOCITY)
+
+    move_wheels(0, 0)
+    return False
+
+
+# ------------- MAIN ROBOT LOOP -----------------
 
 def run_robot():
     global MAX_WHEEL_VELOCITY, imu, last_yaw, yaw_initialized
@@ -355,7 +532,7 @@ def run_robot():
         imu = None
         print(f"[WARN] InertialUnit not found: {e}. Using fallback yaw=0.")
 
-    # Device Initialization
+    # Device Initialization (motors)
     for name in JOINT_NAMES:
         try:
             joints[name] = robot.getDevice(name)
@@ -363,12 +540,31 @@ def run_robot():
             sys.stderr.write(f"Error: Could not find device '{name}'. {e}\n")
             return
 
+    # --- FRONT CAMERA (for AprilTags) ---
     try:
         camera = robot.getDevice("camera")
         camera.enable(time_step)
+        print("[INFO] Front camera 'camera' enabled.")
     except Exception:
         sys.stderr.write("Error: Could not find device 'camera'.\n")
         return
+
+    # --- ARM CAMERA (for white circle) ---
+    try:
+        arm_camera = robot.getDevice("arm_camera")
+        print("[INFO] arm_camera device found (will enable after 180° turn).")
+    except Exception:
+        arm_camera = None
+        print("[WARN] arm_camera not found. White-circle alignment disabled.")
+
+    # --- Emitter to signal arm controller ---
+    try:
+        emitter = robot.getDevice("emitter")
+        emitter.setChannel(1)
+        print("[INFO] Emitter found and set to channel 1.")
+    except Exception:
+        emitter = None
+        print("[WARN] Emitter not found. Cannot signal arm controller.")
 
     # Set wheel motors to velocity control and detect maxVelocity
     wheel_names = [
@@ -394,8 +590,7 @@ def run_robot():
 
     print(f"[INFO] Detected MAX_WHEEL_VELOCITY = {MAX_WHEEL_VELOCITY}")
 
-    # Camera intrinsics: (fx, fy, cx, cy)
-    # Compute fx, fy from Webots FOV
+    # Camera intrinsics for front camera: (fx, fy, cx, cy)
     width = camera.getWidth()
     height = camera.getHeight()
     fov = camera.getFov()  # horizontal FOV in radians
@@ -406,8 +601,18 @@ def run_robot():
     cy = height / 2.0
 
     camera_params = (fx, fy, cx, cy)
-    print(f"[INFO] Camera params: fx={fx:.2f}, fy={fy:.2f}, cx={cx:.2f}, cy={cy:.2f}")
+    print(f"[INFO] Front camera params: fx={fx:.2f}, fy={fy:.2f}, cx={cx:.2f}, cy={cy:.2f}")
 
+    # Camera intrinsics for arm_camera (if present)
+    arm_fx = None
+    if arm_camera is not None:
+        arm_width = arm_camera.getWidth()
+        arm_height = arm_camera.getHeight()
+        arm_fov = arm_camera.getFov()
+        arm_fx = (arm_width / 2.0) / math.tan(arm_fov / 2.0)
+        print(f"[INFO] arm_camera params: fx={arm_fx:.2f}, width={arm_width}, height={arm_height}")
+
+    # AprilTag detector
     at_detector = Detector(
         families=TAG_FAMILY,
         nthreads=1,
@@ -508,20 +713,61 @@ def run_robot():
         if tag_id == 0:
             # 180 degrees -> π radians
             print("ID 0: Turning 180 degrees (π radians).")
+
+            # Make sure steering is straight before the big turn
+            wheels_straight()
+
+            # Re-initialize yaw filter right before doing the 180°
+            yaw_initialized = False
+            _ = get_yaw()  # first call re-seeds last_yaw with current orientation
+
+            # Perform tilt-aware 180° in-place turn using roll/pitch/yaw
             turn_relative(robot, math.pi)
 
-            print("ID 0: STOPPING at ~desired distance before tag, facing opposite direction. Mission ends here.")
-            move_wheels(0, 0)
+            print("ID 0: 180° turn done. Switching to arm_camera for white-circle alignment.")
+
+            # --- SWITCH CAMERAS: disable front camera, enable arm_camera ---
+            try:
+                camera.disable()
+                print("[INFO] Front camera disabled after 180° turn.")
+            except Exception:
+                pass
+
+            aligned = False
+            if arm_camera is not None and arm_fx is not None:
+                arm_camera.enable(time_step)
+                print("[INFO] arm_camera enabled. Starting white-circle alignment.")
+                aligned = align_to_white_circle(
+                    robot,
+                    arm_camera,
+                    arm_fx,
+                    TARGET_CIRCLE_DISTANCE
+                )
+            else:
+                print("[Main] No arm_camera or arm_fx; skipping white-circle alignment.")
+
+            # After alignment, signal arm controller to grab the rock
+            if aligned:
+                print("[Main] Alignment done. Signaling arm to start (START_ARM).")
+                if emitter is not None:
+                    emitter.send(b"START_ARM")
+                else:
+                    print("[WARN] Emitter missing: cannot send START_ARM.")
+            else:
+                print("[Main] Alignment failed or timed out. Not signaling arm.")
+
+           # move_wheels(0, 0)
             robot.step(TIME_STEP)
+            print("ID 0: Mission ends here.")
             break  # final tag behavior (arrival marker)
 
         elif tag_id == 1:
-            # Right 90 degrees or left 90 depending on your observed direction.
+            # Right 90 degrees
             print("ID 1: Turning right 90 degrees (-π/2 radians).")
             turn_relative(robot, -math.pi / 2.0)
 
         elif tag_id == 2:
-            # Left 90 degrees or right 90 depending on your observed direction.
+            # Left 90 degrees
             print("ID 2: Turning left 90 degrees (+π/2 radians).")
             turn_relative(robot, math.pi / 2.0)
 
