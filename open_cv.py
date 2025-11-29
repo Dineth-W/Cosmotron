@@ -5,10 +5,13 @@ from controller import Robot, Camera, Motor, InertialUnit
 import math
 import sys
 
+
+# TODO Fix the clash between
+
 # GLOBAL CONSTANTS
 TIME_STEP = 640
-VELOCITY = 800             # logical speed, will be clamped to motor max
-MAX_SPEED = 2000.0         # logical max for turns, also clamped
+VELOCITY = 3             # logical speed, will be clamped to motor max
+MAX_SPEED = 3         # logical max for turns, also clamped
 TAG_FAMILY = "tag25h9"
 TAG_SIZE = 0.50            # meters
 TARGET_TAG_IDS = [0, 1, 2]
@@ -24,8 +27,14 @@ JOINT_NAMES = [
 ]
 
 joints = {}
-MAX_WHEEL_VELOCITY = 1.0   # will be overwritten from motors
+MAX_WHEEL_VELOCITY = 3.0   # will be overwritten from motors
 imu = None                 # InertialUnit (for yaw)
+
+# --- NEW GLOBALS FOR GROUND-AWARE YAW ---
+last_yaw = 0.0
+yaw_initialized = False
+MAX_TILT_RAD = math.radians(40.0)  # if |roll| or |pitch| > this, treat yaw carefully
+YAW_ALPHA = 0.7                    # low-pass filter factor (0..1), higher = smoother
 
 
 def move_wheels(left_speed, right_speed):
@@ -101,7 +110,7 @@ def select_nearest_tag(detections, camera_params, tag_size=TAG_SIZE):
     return selected_tag, selected_id, min_dist
 
 
-def rotate_to_center(robot, tag, camera, tolerance=10):
+def rotate_to_center(robot, tag, camera, tolerance=5):
     """
     Align robot so the detected tag is horizontally centered in the CAMERA image.
     """
@@ -124,20 +133,48 @@ def rotate_to_center(robot, tag, camera, tolerance=10):
 
 def get_yaw():
     """
-    Return current yaw (heading around vertical axis) from the InertialUnit.
-    If IMU is missing, returns 0.0 so code still runs (turns will be approximate).
+    Return a 'ground-aware' yaw (heading) using the InertialUnit.
+
+    - Uses roll, pitch, yaw from imu.getRollPitchYaw().
+    - Unwraps yaw to avoid +/-pi jumps.
+    - If roll/pitch are very large (robot is strongly tilted), we freeze yaw
+      to the last stable value instead of trusting the noisy reading.
+    - Otherwise we low-pass filter yaw so the heading used for control is smooth.
     """
-    global imu
+    global imu, last_yaw, yaw_initialized, MAX_TILT_RAD, YAW_ALPHA
+
     if imu is None:
-        return 0.0
+        return last_yaw
+
     try:
-        roll, pitch, yaw = imu.getRollPitchYaw()
-        return float(yaw)
+        roll, pitch, yaw = imu.getRollPitchYaw()  # all in radians
+
+        if not yaw_initialized:
+            last_yaw = float(yaw)
+            yaw_initialized = True
+            return last_yaw
+
+        # --- unwrap yaw around last_yaw to avoid 2π jumps ---
+        dyaw = ((yaw - last_yaw + math.pi) % (2 * math.pi)) - math.pi
+        yaw_unwrapped = last_yaw + dyaw
+
+        # --- use roll & pitch to decide how much we trust this yaw ---
+        if abs(roll) > MAX_TILT_RAD or abs(pitch) > MAX_TILT_RAD:
+            # robot is heavily tilted → yaw can be noisy; freeze at last_yaw
+            yaw_ground = last_yaw
+        else:
+            # smooth / filter yaw so uneven ground doesn't cause big heading jumps
+            yaw_ground = YAW_ALPHA * last_yaw + (1.0 - YAW_ALPHA) * yaw_unwrapped
+
+        last_yaw = float(yaw_ground)
+        return last_yaw
+
     except Exception:
-        return 0.0
+        # if anything goes wrong, just reuse last yaw
+        return last_yaw
 
 
-def turn_to_heading(robot, target_yaw, tol=0.1, kp=1.0, max_steps=200):
+def turn_to_heading(robot, target_yaw, tol=0.05, kp=1.0, max_steps=200):
     """
     Turn in-place until IMU yaw is close to target_yaw (in radians).
     Uses a simple P-controller on heading error.
@@ -157,7 +194,7 @@ def turn_to_heading(robot, target_yaw, tol=0.1, kp=1.0, max_steps=200):
         # Proportional control for turn speed
         turn_speed = kp * dtheta  # sign of dtheta controls direction
 
-        # Turn in place: (your robot config) left = turn_speed, right = -turn_speed
+        # Turn in place: left = turn_speed, right = -turn_speed
         left = turn_speed
         right = -turn_speed
 
@@ -172,12 +209,10 @@ def turn_to_heading(robot, target_yaw, tol=0.1, kp=1.0, max_steps=200):
     robot.step(TIME_STEP)
 
 
-def turn_relative(robot, delta_angle, tol=0.5):
+def turn_relative(robot, delta_angle, tol=0.05):
     """
     Turn the rover by delta_angle (radians) relative to current yaw.
     Positive -> one turn direction, Negative -> opposite.
-    (In your current setup: check in sim which side is right/left and
-     choose signs for ID 1 and ID 2 accordingly.)
     """
     current_yaw = get_yaw()
     target_yaw = (current_yaw + delta_angle) % (2 * math.pi)
@@ -192,19 +227,22 @@ def approach_tag(robot, camera, at_detector, camera_params, target_id, desired_s
     - While the tag is visible: keep recentering and using its distance.
     - Once we've seen the tag at least once, if it later becomes partially
       blocked or disappears (close to it), we:
-        * do NOT spin to search again,
-        * instead, use the last known distance to drive forward in open loop
-          to roughly reach the desired_stop_dist.
+        * do NOT spin to search again immediately,
+        * if it stays lost for several frames in a row, then we use the last
+          known distance to drive forward in open loop to roughly reach
+          desired_stop_dist.
 
-    This way the rover can complete the approach even if the tag is only
-    partially visible or moves out of the frame near the end.
+    While we are in that "calculated steps" open-loop, we DO NOT re-center or
+    track other tags – we just finish the steps and exit.
     """
     lost_counter = 0
     seen_once = False
     last_dist = None
 
     # Approximate distance the rover moves in one "open-loop" step (meters)
-    approx_step_dist = 0.05
+    approx_step_dist = 3
+    # How many consecutive lost frames we tolerate before switching to open-loop
+    LOST_GRACE_FRAMES = 10
 
     while robot.step(TIME_STEP) != -1:
         image_data = camera.getImage()
@@ -225,7 +263,7 @@ def approach_tag(robot, camera, at_detector, camera_params, target_id, desired_s
 
         # --- CASE 1: Tag visible in this frame ---
         if detections:
-            lost_counter = 0
+            lost_counter = 0          # reset lost counter (tag came back)
             seen_once = True
 
             selected_tag, _, dist = select_nearest_tag(detections, camera_params, TAG_SIZE)
@@ -271,21 +309,22 @@ def approach_tag(robot, camera, at_detector, camera_params, target_id, desired_s
 
             # We HAVE seen the tag before: now it's partially blocked or out of FOV.
             lost_counter += 1
-            print(f"[Approach] Tag {target_id} temporarily lost after being seen.")
+            print(f"[Approach] Tag {target_id} temporarily lost after being seen. lost_count={lost_counter}")
 
-            # If it's only a short glitch, gently keep going forward (no spinning)
-            # if lost_counter <= 5:
-            #     move_wheels(VELOCITY * 0.5, VELOCITY * 0.5)
-            #     robot.step(TIME_STEP)
-            #     continue
+            # If it's a short glitch, just creep forward a bit and hope it reappears.
+            if lost_counter <= LOST_GRACE_FRAMES:
+                move_wheels(VELOCITY * 0.5, VELOCITY * 0.5)
+                robot.step(TIME_STEP)
+                continue
 
-            # Lost for a longer time but we had a last valid distance -> finish open-loop
+            # Lost for longer than grace window and we have a last valid distance:
+            # -> finish open-loop (calculated steps) and DO NOT track other tags
             if last_dist is not None:
                 remaining = max(0.0, last_dist - desired_stop_dist)
                 if remaining > 0.0:
                     steps = int(remaining / approx_step_dist)
-                    print(f"[Approach] Finishing in open-loop for ~{remaining:.2f} m "
-                          f"({steps} steps) using last_dist={last_dist:.2f} m.")
+                    print(f"[Approach] Tag {target_id} lost for long; finishing in open-loop "
+                          f"for ~{remaining:.2f} m ({steps} steps) using last_dist={last_dist:.2f} m.")
                     for _ in range(steps):
                         move_wheels(VELOCITY, VELOCITY)
                         robot.step(TIME_STEP)
@@ -299,7 +338,7 @@ def approach_tag(robot, camera, at_detector, camera_params, target_id, desired_s
 
 
 def run_robot():
-    global MAX_WHEEL_VELOCITY, imu
+    global MAX_WHEEL_VELOCITY, imu, last_yaw, yaw_initialized
 
     robot = Robot()
     time_step = int(robot.getBasicTimeStep())
@@ -309,6 +348,9 @@ def run_robot():
         imu = robot.getDevice("inertial unit")  # name must match your Webots world
         imu.enable(time_step)
         print("[INFO] InertialUnit found and enabled.")
+        # reset yaw filter
+        last_yaw = 0.0
+        yaw_initialized = False
     except Exception as e:
         imu = None
         print(f"[WARN] InertialUnit not found: {e}. Using fallback yaw=0.")
@@ -475,7 +517,6 @@ def run_robot():
 
         elif tag_id == 1:
             # Right 90 degrees or left 90 depending on your observed direction.
-            # Currently: negative angle. If this is visually "left", swap signs.
             print("ID 1: Turning right 90 degrees (-π/2 radians).")
             turn_relative(robot, -math.pi / 2.0)
 
