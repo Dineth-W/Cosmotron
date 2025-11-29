@@ -10,8 +10,8 @@ import sys
 
 # GLOBAL CONSTANTS
 TIME_STEP = 640
-VELOCITY = 800             # logical speed, will be clamped to motor max
-MAX_SPEED = 2000.0         # logical max for turns, also clamped
+VELOCITY = 3             # logical speed, will be clamped to motor max
+MAX_SPEED = 3         # logical max for turns, also clamped
 TAG_FAMILY = "tag25h9"
 TAG_SIZE = 0.50            # meters
 TARGET_TAG_IDS = [0, 1, 2]
@@ -27,7 +27,7 @@ JOINT_NAMES = [
 ]
 
 joints = {}
-MAX_WHEEL_VELOCITY = 1.0   # will be overwritten from motors
+MAX_WHEEL_VELOCITY = 3.0   # will be overwritten from motors
 imu = None                 # InertialUnit (for yaw)
 
 # --- NEW GLOBALS FOR GROUND-AWARE YAW ---
@@ -240,7 +240,7 @@ def approach_tag(robot, camera, at_detector, camera_params, target_id, desired_s
     last_dist = None
 
     # Approximate distance the rover moves in one "open-loop" step (meters)
-    approx_step_dist = 0.6
+    approx_step_dist = 3
     # How many consecutive lost frames we tolerate before switching to open-loop
     LOST_GRACE_FRAMES = 10
 
