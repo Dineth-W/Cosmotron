@@ -1,11 +1,12 @@
 from controller import Robot
 
 # --- CONSTANTS ---
-CANDLE                  = [0.0 ,0.0, 0.0, 0.0, 0.0]
-ARM_FRONT_CARDBOARD_BOX = [0.0, -0.5, 1.0, -1.5, 0.0]
-ARM_RESET               = [0.0, 0.0, 0.0, 0.0, 0.0] 
-ARM_FOLDED              = [0.0, -1.9, 0.1, 0.1, 0.0]
-RESTING                 = [0, 1.8, -2.6, -0.5, 0.0]
+CANDLE                  = [0.0,  0.0,  0.0,  0.0, 0.0]
+ARM_FRONT_CARDBOARD_BOX = [0.0, -0.5,  1.0, -1.5, 0.0]
+ARM_RESET               = [0.0,  0.0,  0.0,  0.0, 0.0]
+ARM_FOLDED              = [0.0, -1.9,  0.1,  0.1, 0.0]
+RESTING                 = [0.0,  1.8, -2.6, -0.5, 0.0]
+
 
 # --- CLASS DEFINITION ---
 class YouBot(Robot):
@@ -13,15 +14,20 @@ class YouBot(Robot):
         super(YouBot, self).__init__()
         self.timestep = int(self.getBasicTimeStep())
 
+        # --- RECEIVER INIT ---
         self.receiver = self.getDevice("receiver")
         if self.receiver:
             self.receiver.enable(self.timestep)
-            self.receiver.setChannel(1) # Listen on channel 1
+            self.receiver.setChannel(1)  # Listen on channel 1 (must match rover emitter)
+            print("[Arm] Receiver enabled on channel 1.")
+        else:
+            print("[Arm][WARN] Receiver device not found!")
 
         # --- CAMERA INIT ---
-        self.cam = self.getDevice('gripper_camera')
+        self.cam = self.getDevice("gripper_camera")
         if self.cam:
             self.cam.enable(self.timestep)
+            print("[Arm] gripper_camera enabled.")
 
         # --- ARM MOTORS INIT ---
         self.arm_motors = []
@@ -31,10 +37,9 @@ class YouBot(Robot):
 
         # --- ROBOTIQ 3F GRIPPER INIT ---
         self.gripper_motors = {}
-        
-        # Define the motors
+
         target_names = [
-            "palm_finger_1_joint", "palm_finger_2_joint", # Scissor joints
+            "palm_finger_1_joint", "palm_finger_2_joint",  # Scissor joints
             "finger_1_joint_1", "finger_1_joint_2", "finger_1_joint_3",
             "finger_2_joint_1", "finger_2_joint_2", "finger_2_joint_3",
             "finger_middle_joint_1", "finger_middle_joint_2", "finger_middle_joint_3"
@@ -44,20 +49,15 @@ class YouBot(Robot):
             device = self.getDevice(name)
             if device:
                 self.gripper_motors[name] = device
-                
-                # --- FIX FOR AGGRESSIVE GRIP ---
-                # 1. Slow down the fingers so they don't slap the rock
-                device.setVelocity(0.5)  # Default is often > 1.0
-                
-                # 2. Limit the strength (Torque) of the curling fingers
-                # If "palm" is NOT in the name, it's a curling joint.
+
+                # Slow down fingers so they don't slap the rock
+                device.setVelocity(0.5)
+
+                # Limit torque on curling joints
                 if "palm" not in name:
-                    # Set max torque low (e.g., 0.1 to 0.5 Newton-meters)
-                    # Adjust this value: 
-                    # 0.1 = Very gentle (might drop heavy rocks)
-                    # 0.4 = Medium grip
-                    # 1.0+ = Crushing grip
-                    device.setAvailableTorque(0.6) 
+                    device.setAvailableTorque(0.6)
+
+    # --- STEP / WAIT HELPERS ---
 
     def step_sim(self):
         if self.step(self.timestep) == -1:
@@ -67,149 +67,162 @@ class YouBot(Robot):
         start = self.getTime()
         while self.getTime() < start + seconds:
             self.step_sim()
-    
+
+    # --- WAIT FOR ROVER SIGNAL ---
+
     def wait_for_start_signal(self):
-        print("Arm is in standby. Waiting for Rover signal...")
-        
+        """
+        Block until a 'START_ARM' string is received on the receiver.
+        """
+        if not self.receiver:
+            print("[Arm][WARN] No receiver found. Starting behavior immediately.")
+            return
+
+        print("[Arm] In standby. Waiting for Rover signal 'START_ARM'...")
+
         while True:
-            # Check if there is a message in the queue
-            if self.receiver.getQueueLength() > 0:
-                # Read the message
-                #message = self.receiver.getData().decode('utf-8')
-                message = self.receiver.getString() 
-                self.receiver.nextPacket() # Discard packet after reading
-                
-                if message == "START_ARM":
-                    print("Signal received! Activating Arm.")
-                    break # Exit the loop and continue program
-            
-            # Keep simulation running while waiting
+            # Process simulation step
             self.step_sim()
-            
-            
+
+            # Check if there is a message in the queue
+            while self.receiver.getQueueLength() > 0:
+                # Read the message as string
+                message = self.receiver.getString()
+                self.receiver.nextPacket()  # Discard packet after reading
+
+                print(f"[Arm] Received message: {message}")
+                if message == "START_ARM":
+                    print("[Arm] START_ARM signal received! Activating Arm.")
+                    return
+
     # --- ROBOTIQ GRIPPER FUNCTIONS ---
+
     def gripper_grip(self):
         """Closes the 3F gripper gently around an object."""
-        
-        # When gripping, we want the motors to be weak (compliant)
+        # When gripping, we want the motors to be compliant (not too strong)
         for name, motor in self.gripper_motors.items():
             if "palm" not in name:
-                motor.setAvailableTorque(1.8) # Ensure torque is low for gripping
+                motor.setAvailableTorque(1.8)  # your chosen torque
 
         for name, motor in self.gripper_motors.items():
             # Scissor joints: Keep straight
             if "palm" in name:
                 motor.setPosition(0.0)
-            
+
             # Joint 1 (Knuckles): The main closing force
             elif "joint_1" in name:
-                motor.setPosition(0.65) # Target slightly less than full close
-                
-            # Joint 2 (Middle):
-            elif "joint_2" in name:
-                motor.setPosition(0.5) 
+                motor.setPosition(0.65)
 
-            # Joint 3 (Tips): Keep these loose or slightly negative
-            # Setting them to a loose position allows the rock to push them open
+            # Joint 2 (Middle)
+            elif "joint_2" in name:
+                motor.setPosition(0.5)
+
+            # Joint 3 (Tips): slightly negative / loose
             elif "joint_3" in name:
                 motor.setPosition(-0.04)
 
     def gripper_release(self):
         """Opens the 3F gripper."""
-        
-        # When opening, we can use more power to ensure it actually opens
         for name, motor in self.gripper_motors.items():
-            motor.setAvailableTorque(1.0) # Restore torque to open reliably
-            
+            motor.setAvailableTorque(1.0)  # enough power to open
             if "palm" not in name:
                 motor.setPosition(0.0)
 
     # --- ARM FUNCTIONS ---
+
     def arm_set_height(self, pose):
+        # arm2..arm5 (arm_motors[1]..[4]) correspond to joints 2..5 in pose
         for i in range(1, 5):
             self.arm_motors[i].setPosition(pose[i])
-            
+
     def arm_set_orientation(self, angle):
+        # arm1 (arm_motors[0]) is the base rotation
         self.arm_motors[0].setPosition(angle)
-    
+
     def arm_set_rotate(self, motor_id, angle):
-        index = motor_id - 1 
+        index = motor_id - 1
         if 0 <= index < len(self.arm_motors):
             self.arm_motors[index].setPosition(angle)
-    
+
     def arm_reset(self):
         self.arm_set_height(ARM_RESET)
-        
+
     def arm_fold(self):
         self.arm_set_height(ARM_FOLDED)
 
-    # --- AUTOMATIC BEHAVIOR ---
-    def run_automatic_behavior(self):
-        # print("Starting Automatic Behavior...")
-        
+    # --- AUTOMATIC BEHAVIOR TRIGGERED BY ROVER ---
+
+    def run_auto(self):
        
-       #arm is still at rest
+        self.wait_for_start_signal()
+     
+
+        print("[Arm] Initializing automatic mode...")
+
+        #arm is still at rest
         self.gripper_release()
         self.passive_wait(1.0)
         print("ARM at Rover Bed..")
-      
-      
-     # lifting from rover bed 
+     
+     
+     # lifting from rover bed
         print("Lifting...")
         self.arm_set_rotate(2, -1.12)
         self.arm_set_rotate(3, 1.5)
         self.passive_wait(2.0)
-        
+       
      # Rotaing from rover
         print("Rotating...")
-        self.arm_set_rotate(1, 3.14/2)
+        self.arm_set_rotate(1, 3.14)
         self.passive_wait(2.0)
 
     #lowering arm
         print("Lowering arm...")
+        self.arm_set_rotate(5, 1.57)
+        self.passive_wait(2.0)
         self.arm_set_rotate(2, -2.8)
         #self.arm_set_height(ARM_FOLDED)
         self.passive_wait(4.0)
+       # self.arm_set_rotate(5, 1.57)
         print("Behavior Update.")
-        
+       
     #gripping rock
-        
+       
         print("Gripping...")
         self.gripper_grip()
         self.passive_wait(5.0)
-        
+       
     #lift arm 2
-        
+       
         print("Lifting arm...")
         self.arm_set_rotate(2, -0.8)
         self.passive_wait(2.0)
-        
+       
      # rotate to rover 2
         print("Rotating arm...")
         self.arm_set_rotate(3,0.7)
         self.passive_wait(3.0)
-        self.arm_set_rotate(1,-1.57)
-        self.passive_wait(2.0) 
+        self.arm_set_rotate(1,-0.08)
+        self.passive_wait(2.0)
         # bot.arm_set_height(CANDLE)
         # self.passive_wait(5.0)
-        
+       
       # rock put
         print("Astroid saved...")
         self.gripper_release()
-        self.arm_set_rotate(4,-0.4)
+        self.arm_set_rotate(4,-0.9)
         self.passive_wait(3.0)  
         # bot.arm_set_height(RESTING)
         # self.passive_wait(5.0)
-        
+       
         print("Behavior Complete.")
 
-# --- MAIN EXECUTION ---
+        # Keep simulation alive (hold current pose)
+        while True:
+            self.step_sim()
+
+
 if __name__ == "__main__":
-    bot = YouBot()
-    
-    
-    bot.passive_wait(1.0)
-    bot.run_automatic_behavior()
-    
-    while True:
-        bot.step_sim()
+   
+    controller = YouBot()
+    controller.run_auto()
