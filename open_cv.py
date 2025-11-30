@@ -17,10 +17,10 @@ WAYPOINT_TOLERANCE = 0.02 # meters
 MAX_TAG_VISITS = 5        # visit ~5 tags total (IDs can repeat)
 
 # White circle properties (for arm_camera alignment)
-WHITE_CIRCLE_DIAMETER = 0.20      # meters (adjust to your real circle size)
-TARGET_CIRCLE_DISTANCE = 0.25     # meters (25 cm from circle)
+WHITE_CIRCLE_DIAMETER = 0.20      # meters (kept for reference, not used for distance now)
+TARGET_CIRCLE_DISTANCE = 0.01     # not used anymore for motion, but kept as a constant
 CIRCLE_CENTER_TOL_PX = 10         # pixels tolerance for centering
-CIRCLE_DIST_TOL_M   = 0.02        # ±2 cm distance tolerance
+CIRCLE_DIST_TOL_M   = 0.02        # unused now, kept for reference
 
 # MOTOR NAMES
 JOINT_NAMES = [
@@ -243,12 +243,8 @@ def turn_to_heading(robot, target_yaw, tol=0.05, kp=1.0, max_steps=200):
         turn_speed = kp * dtheta * tilt_factor  # sign of dtheta controls direction
 
         # Turn in place: left = +turn_speed, right = -turn_speed
-        left = turn_speed
-        right = -turn_speed
-
-        # Clamp to motor limits
-        left = float(np.clip(left, -MAX_WHEEL_VELOCITY, MAX_WHEEL_VELOCITY))
-        right = float(np.clip(right, -MAX_WHEEL_VELOCITY, MAX_WHEEL_VELOCITY))
+        left = float(np.clip(turn_speed, -MAX_WHEEL_VELOCITY, MAX_WHEEL_VELOCITY))
+        right = float(np.clip(-turn_speed, -MAX_WHEEL_VELOCITY, MAX_WHEEL_VELOCITY))
 
         move_wheels(left, right)
         robot.step(TIME_STEP)
@@ -432,19 +428,20 @@ def detect_white_circle(bgr_image):
     return (x, y, radius)
 
 
-def align_to_white_circle(robot, arm_camera, fx_arm, target_distance_m=TARGET_CIRCLE_DISTANCE*0.75,
+def align_to_white_circle(robot,
+                          arm_camera,
                           center_tolerance_px=CIRCLE_CENTER_TOL_PX,
-                          dist_tolerance_m=CIRCLE_DIST_TOL_M,
                           max_frames=600):
     """
-    Use arm_camera to:
-      1. Spin / move until the white circle is centered horizontally.
-      2. Adjust forward/backward distance so the estimated distance is ~target_distance_m.
+    Use arm_camera (mounted at the BACK of the rover) to:
+      1. Spin until the white circle is centered horizontally in the image.
+      2. As soon as the circle is centered, STOP and return True.
 
-    Returns True if alignment succeeded, False on timeout/failure.
+    No distance sensor and no forward/backward distance adjustment:
+    after centering, the caller (main) will signal arm_controll.py.
     """
-    if arm_camera is None or fx_arm is None:
-        print("[AlignCircle] arm_camera or fx_arm missing. Cannot align.")
+    if arm_camera is None:
+        print("[AlignCircle] arm_camera missing. Cannot align.")
         return False
 
     width = arm_camera.getWidth()
@@ -452,7 +449,7 @@ def align_to_white_circle(robot, arm_camera, fx_arm, target_distance_m=TARGET_CI
     center_x = width / 2.0
 
     frame_count = 0
-    print("[AlignCircle] Starting alignment using arm_camera...")
+    print("[AlignCircle] Starting alignment using arm_camera (centering only)...")
 
     while robot.step(TIME_STEP) != -1:
         frame_count += 1
@@ -471,42 +468,24 @@ def align_to_white_circle(robot, arm_camera, fx_arm, target_distance_m=TARGET_CI
         if circle is None:
             # No circle → slowly rotate to search
             move_wheels(-0.2 * MAX_WHEEL_VELOCITY, 0.2 * MAX_WHEEL_VELOCITY)
+            print("[AlignCircle] No circle detected. Rotating to search...")
             continue
 
         cx, cy, radius = circle
 
-        # ---- STEP 1: HORIZONTAL CENTERING ----
+        # ---- STEP: HORIZONTAL CENTERING ONLY ----
         offset_x = cx - center_x
         if abs(offset_x) > center_tolerance_px:
             # rotate to reduce horizontal offset
             turn_speed = np.clip(0.004 * offset_x, -MAX_SPEED, MAX_SPEED)
             move_wheels(-turn_speed, turn_speed)
+            print(f"[AlignCircle] Centering circle: offset_x={offset_x:.1f}")
             continue
 
-        # At this point, horizontally centered → adjust distance
-        if radius <= 0:
-            move_wheels(0, 0)
-            continue
-
-        # distance ≈ (physical_diameter * fx) / (diameter_in_pixels)
-        est_dist = (WHITE_CIRCLE_DIAMETER * fx_arm) / (2.0 * radius)
-        diff = est_dist - target_distance_m
-
-        print(f"[AlignCircle] Centered. est_dist={est_dist:.3f} m, "
-              f"target={target_distance_m:.3f} m, diff={diff:.3f} m, radius_px={radius:.1f}")
-
-        if abs(diff) <= dist_tolerance_m:
-            move_wheels(0, 0)
-            print("[AlignCircle] Alignment complete: centered and at target distance.")
-            return True
-
-        # Move forward/backward depending on whether we're too far or too close
-        if diff > 0:
-            # too far → move forward
-            move_wheels(VELOCITY, VELOCITY)
-        else:
-            # too close → move backwards
-            move_wheels(-VELOCITY, -VELOCITY)
+        # We are centered horizontally → stop and report success
+        move_wheels(0, 0)
+        print(f"[AlignCircle] Circle centered. cx={cx:.1f}, center_x={center_x:.1f}, radius={radius:.1f}")
+        return True
 
     move_wheels(0, 0)
     return False
@@ -603,7 +582,7 @@ def run_robot():
     camera_params = (fx, fy, cx, cy)
     print(f"[INFO] Front camera params: fx={fx:.2f}, fy={fy:.2f}, cx={cx:.2f}, cy={cy:.2f}")
 
-    # Camera intrinsics for arm_camera (if present)
+    # Camera intrinsics for arm_camera (if present) – only for debug now
     arm_fx = None
     if arm_camera is not None:
         arm_width = arm_camera.getWidth()
@@ -628,7 +607,7 @@ def run_robot():
     # Visit up to MAX_TAG_VISITS tags (IDs can repeat)
     for mission_step in range(MAX_TAG_VISITS):
         print(f"\n=== Mission step {mission_step + 1} ===")
-        found_tag = False
+        found_tag = False        # reset for this mission step
         tag_id = None
         measured_dist = None
 
@@ -722,33 +701,36 @@ def run_robot():
             _ = get_yaw()  # first call re-seeds last_yaw with current orientation
 
             # Perform tilt-aware 180° in-place turn using roll/pitch/yaw
-            turn_relative(robot, math.pi)
+            tol_180 = 0.6
+            turn_relative(robot, math.pi, tol_180)
 
             print("ID 0: 180° turn done. Switching to arm_camera for white-circle alignment.")
 
-            # --- SWITCH CAMERAS: disable front camera, enable arm_camera ---
-            try:
-                camera.disable()
-                print("[INFO] Front camera disabled after 180° turn.")
-            except Exception:
-                pass
-
             aligned = False
-            if arm_camera is not None and arm_fx is not None:
+            if arm_camera is not None:
+                # a) Turn off front camera
+                try:
+                    camera.disable()
+                    print("[INFO] Front camera disabled after 180° turn.")
+                except Exception:
+                    pass
+
+                # b) Turn on arm_camera (rear camera)
                 arm_camera.enable(time_step)
-                print("[INFO] arm_camera enabled. Starting white-circle alignment.")
+                print("[INFO] arm_camera enabled. Starting white-circle centering.")
+
+                # c) Use arm_camera to center the white circle only
                 aligned = align_to_white_circle(
                     robot,
                     arm_camera,
-                    arm_fx,
-                    TARGET_CIRCLE_DISTANCE
+                    center_tolerance_px=CIRCLE_CENTER_TOL_PX
                 )
             else:
-                print("[Main] No arm_camera or arm_fx; skipping white-circle alignment.")
+                print("[Main] arm_camera missing; skipping white-circle alignment.")
 
-            # After alignment, signal arm controller to grab the rock
+            # 4. Signal arm_controll.py via emitter
             if aligned:
-                print("[Main] Alignment done. Signaling arm to start (START_ARM).")
+                print("[Main] Alignment done (circle centered). Signaling arm to start (START_ARM).")
                 if emitter is not None:
                     emitter.send(b"START_ARM")
                 else:
@@ -756,7 +738,6 @@ def run_robot():
             else:
                 print("[Main] Alignment failed or timed out. Not signaling arm.")
 
-           # move_wheels(0, 0)
             robot.step(TIME_STEP)
             print("ID 0: Mission ends here.")
             break  # final tag behavior (arrival marker)
