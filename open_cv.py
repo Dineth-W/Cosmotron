@@ -289,7 +289,7 @@ def approach_tag(robot, camera, at_detector, camera_params, target_id, desired_s
     # Approximate distance the rover moves in one "open-loop" step (meters)
     approx_step_dist = 3
     # How many consecutive lost frames we tolerate before switching to open-loop
-    LOST_GRACE_FRAMES = 10
+    LOST_GRACE_FRAMES = 6
 
     while robot.step(TIME_STEP) != -1:
         image_data = camera.getImage()
