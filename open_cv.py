@@ -17,7 +17,7 @@ WAYPOINT_TOLERANCE = 0.02 # meters
 MAX_TAG_VISITS = 5        # visit ~5 tags total (IDs can repeat)
 
 # White circle properties (for arm_camera alignment)
-WHITE_CIRCLE_DIAMETER = 0.20      # meters (kept for reference, not used for distance now)
+WHITE_CIRCLE_DIAMETER = 0.20      # meters (kept for reference)
 TARGET_CIRCLE_DISTANCE = 0.01     # not used anymore for motion, but kept as a constant
 CIRCLE_CENTER_TOL_PX = 10         # pixels tolerance for centering
 CIRCLE_DIST_TOL_M   = 0.02        # unused now, kept for reference
@@ -425,20 +425,23 @@ def detect_white_circle(bgr_image):
     if radius < 3:  # ignore very small circles
         return None
 
+    print(radius)
     return (x, y, radius)
 
 
 def align_to_white_circle(robot,
                           arm_camera,
+                          target_radius_px=75,
                           center_tolerance_px=CIRCLE_CENTER_TOL_PX,
-                          max_frames=600):
+                          radius_tolerance_px=3,
+                          max_frames=1200):
     """
     Use arm_camera (mounted at the BACK of the rover) to:
       1. Spin until the white circle is centered horizontally in the image.
-      2. As soon as the circle is centered, STOP and return True.
+      2. Then drive forward/backward until the circle radius is ≈ target_radius_px.
+      3. When both conditions are satisfied, STOP and return True.
 
-    No distance sensor and no forward/backward distance adjustment:
-    after centering, the caller (main) will signal arm_controll.py.
+    After returning True, the caller will signal arm_controll.py.
     """
     if arm_camera is None:
         print("[AlignCircle] arm_camera missing. Cannot align.")
@@ -449,7 +452,7 @@ def align_to_white_circle(robot,
     center_x = width / 2.0
 
     frame_count = 0
-    print("[AlignCircle] Starting alignment using arm_camera (centering only)...")
+    print("[AlignCircle] Starting alignment using arm_camera (center + radius)...")
 
     while robot.step(TIME_STEP) != -1:
         frame_count += 1
@@ -473,19 +476,36 @@ def align_to_white_circle(robot,
 
         cx, cy, radius = circle
 
-        # ---- STEP: HORIZONTAL CENTERING ONLY ----
+        # ---- STEP 1: HORIZONTAL CENTERING ----
         offset_x = cx - center_x
         if abs(offset_x) > center_tolerance_px:
             # rotate to reduce horizontal offset
             turn_speed = np.clip(0.004 * offset_x, -MAX_SPEED, MAX_SPEED)
             move_wheels(-turn_speed, turn_speed)
-            print(f"[AlignCircle] Centering circle: offset_x={offset_x:.1f}")
+            print(f"[AlignCircle] Centering circle: offset_x={offset_x:.1f}, radius={radius:.1f}")
             continue
 
-        # We are centered horizontally → stop and report success
-        move_wheels(0, 0)
-        print(f"[AlignCircle] Circle centered. cx={cx:.1f}, center_x={center_x:.1f}, radius={radius:.1f}")
-        return True
+        # ---- STEP 2: DISTANCE VIA RADIUS ----
+        radius_error = radius - target_radius_px
+
+        if abs(radius_error) <= radius_tolerance_px:
+            # Centered and at desired distance
+            move_wheels(0, 0)
+            print(f"[AlignCircle] Circle centered and at target radius. "
+                  f"radius={radius:.1f}, target={target_radius_px}, offset_x={offset_x:.1f}")
+            return True
+
+        # If radius is too small → circle is far → move CLOSER.
+        # Because arm_camera looks backwards, moving closer means driving BACKWARDS.
+        if radius < target_radius_px - radius_tolerance_px:
+            move_wheels(-VELOCITY * 0.7, -VELOCITY * 0.7)
+            print(f"[AlignCircle] Circle too small (radius={radius:.1f} < {target_radius_px}). "
+                  f"Moving backward to get closer...")
+        # If radius is too large → circle is too close → move away (FORWARDS).
+        else:
+            move_wheels(VELOCITY * 0.7, VELOCITY * 0.7)
+            print(f"[AlignCircle] Circle too large (radius={radius:.1f} > {target_radius_px}). "
+                  f"Moving forward to get farther...")
 
     move_wheels(0, 0)
     return False
@@ -717,12 +737,13 @@ def run_robot():
 
                 # b) Turn on arm_camera (rear camera)
                 arm_camera.enable(time_step)
-                print("[INFO] arm_camera enabled. Starting white-circle centering.")
+                print("[INFO] arm_camera enabled. Starting white-circle centering + distance.")
 
-                # c) Use arm_camera to center the white circle only
+                # c) Use arm_camera to center the white circle and adjust distance (radius→75)
                 aligned = align_to_white_circle(
                     robot,
                     arm_camera,
+                    target_radius_px=75,
                     center_tolerance_px=CIRCLE_CENTER_TOL_PX
                 )
             else:
@@ -730,7 +751,7 @@ def run_robot():
 
             # 4. Signal arm_controll.py via emitter
             if aligned:
-                print("[Main] Alignment done (circle centered). Signaling arm to start (START_ARM).")
+                print("[Main] Alignment done (circle centered & radius ~75). Signaling arm to start (START_ARM).")
                 if emitter is not None:
                     emitter.send(b"START_ARM")
                 else:
