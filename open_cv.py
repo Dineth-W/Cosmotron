@@ -266,7 +266,7 @@ def turn_relative(robot, delta_angle, tol=0.05):
 
 # ------------- APPROACH APRILTAG -----------------
 
-def approach_tag(robot, camera, at_detector, camera_params, target_id, desired_stop_dist):
+def approach_tag(robot, camera, at_detector, camera_params, target_id, desired_stop_dist,LOST_GRACE_FRAMES = 6):
     """
     Move towards the tag using CAMERA distance in a feedback loop.
 
@@ -289,7 +289,7 @@ def approach_tag(robot, camera, at_detector, camera_params, target_id, desired_s
     # Approximate distance the rover moves in one "open-loop" step (meters)
     approx_step_dist = 3
     # How many consecutive lost frames we tolerate before switching to open-loop
-    LOST_GRACE_FRAMES = 6
+    #LOST_GRACE_FRAMES = 6
 
     while robot.step(TIME_STEP) != -1:
         image_data = camera.getImage()
@@ -702,11 +702,13 @@ def run_robot():
         # --- APPROACH TAG USING CAMERA DISTANCE FEEDBACK + OPEN-LOOP NEARBY ---
         if tag_id == 0:
             desired_stop_dist = 1.4
+            lost_grace_frame = 3
         else:
             desired_stop_dist = 1.0
+            lost_grace_frame = 6
 
         print(f"Approaching tag {tag_id} to stop at ~{desired_stop_dist} m.")
-        approach_tag(robot, camera, at_detector, camera_params, tag_id, desired_stop_dist)
+        approach_tag(robot, camera, at_detector, camera_params, tag_id, desired_stop_dist, lost_grace_frame)
 
         # ========== SIMPLE TAG-BASED ROTATIONS (NO FINE-ALIGN) ==========
         if tag_id == 0:
@@ -721,7 +723,7 @@ def run_robot():
             _ = get_yaw()  # first call re-seeds last_yaw with current orientation
 
             # Perform tilt-aware 180° in-place turn using roll/pitch/yaw
-            tol_180 = 0.6
+            tol_180 = 0.5
             turn_relative(robot, math.pi, tol_180)
 
             print("ID 0: 180° turn done. Switching to arm_camera for white-circle alignment.")
